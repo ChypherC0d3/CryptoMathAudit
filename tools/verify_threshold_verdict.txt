@@ -1,0 +1,217 @@
+THRESHOLD NETWORK keep-core VULNERABILITY VERIFICATION
+=======================================================
+Date: 2026-03-28
+Auditor: Independent verification from scratch
+Repository: https://github.com/threshold-network/keep-core
+File: pkg/tecdsa/retry/retry.go, line 308
+
+=======================================================
+STEP 1: BUG EXISTENCE
+=======================================================
+
+CONFIRMED. Line 308 reads:
+
+    rightOperator := operators[j]
+
+In context (lines 303-319):
+
+    for i := 0; i < len(operators)-2; i++ {
+        for j := i + 1; j < len(operators)-1; j++ {
+            for k := j + 1; k < len(operators); k++ {
+                leftOperator := operators[i]
+                middleOperator := operators[j]
+                rightOperator := operators[j]   // <--- BUG: should be operators[k]
+
+This is clearly a copy-paste error. The pair exclusion function above
+(lines 248-263) uses operators[i] and operators[j] for a 2-variable
+loop. The triplet function adds a third loop variable k but the
+rightOperator assignment was copied from the pair function and never
+updated from operators[j] to operators[k].
+
+=======================================================
+STEP 2: COPY-PASTE PATTERN CONFIRMATION
+=======================================================
+
+Pair exclusion (correct):
+    for i := 0; i < len(operators)-1; i++ {
+        for j := i + 1; j < len(operators); j++ {
+            leftOperator := operators[i]
+            rightOperator := operators[j]     // correct: uses j
+
+Triplet exclusion (buggy):
+    for i := 0; i < len(operators)-2; i++ {
+        for j := i + 1; j < len(operators)-1; j++ {
+            for k := j + 1; k < len(operators); k++ {
+                leftOperator := operators[i]
+                middleOperator := operators[j]
+                rightOperator := operators[j]  // BUG: should be operators[k]
+
+The pattern is unmistakable. The triplet function was derived from the
+pair function by adding an inner loop (k) and a middleOperator, but
+rightOperator was not updated to use k.
+
+=======================================================
+STEP 3: IMPACT ANALYSIS
+=======================================================
+
+What the bug causes:
+- The seat-count eligibility check for triplet exclusion is WRONG.
+  It calculates: groupMembers - seats(operators[i]) - seats(operators[j]) - seats(operators[j])
+  Instead of:    groupMembers - seats(operators[i]) - seats(operators[j]) - seats(operators[k])
+
+- This means middleOperator's seats are double-counted and the third
+  operator's (k's) seats are ignored entirely in the eligibility filter.
+
+- However, the ACTUAL EXCLUSION (lines 327-330) is CORRECT:
+    leftOperator := operators[triplet[0]]
+    middleOperator := operators[triplet[1]]
+    rightOperator := operators[triplet[2]]   // correctly uses triplet[2]
+
+  The tripletIndexes array stores {i, j, k} correctly at line 318.
+
+NUANCED IMPACT:
+The bug is ONLY in the eligibility filter that determines which triplets
+are candidates for exclusion. The actual triplet exclusion logic works
+correctly once a triplet is selected. This means:
+
+1. Some valid triplets may be INCORRECTLY EXCLUDED from the candidate list
+   (if middleOperator has many seats, double-counting makes it look like
+   too many seats would be removed).
+
+2. Some invalid triplets may be INCORRECTLY INCLUDED (if the k-th operator
+   has many seats that would push the remaining count below the threshold,
+   but this is not checked).
+
+3. For case (2), the system would attempt to exclude a triplet that leaves
+   too few participants, potentially causing DKG to fail even when excluding
+   that triplet. This reduces the effective retry space.
+
+4. For case (1), valid triplet exclusion candidates are skipped, meaning
+   colluding triplets that SHOULD be excludable might never get excluded.
+
+ATTACK SCENARIO:
+If 3 malicious operators are colluding to disrupt DKG:
+- Single operator exclusion (works correctly) will not catch them.
+- Pair exclusion (works correctly) will not catch them if all 3 are needed.
+- Triplet exclusion has a BROKEN eligibility filter, so the correct
+  malicious triplet may not appear in the candidate list at all,
+  or the candidate list may contain wrong triplets.
+
+This means the retry mechanism may fail to ever try excluding the
+correct malicious triplet, making DKG permanently stuck if 3 operators
+collude. The claim of permanent DoS on wallet creation is plausible.
+
+HOWEVER - SEVERITY MITIGATING FACTORS:
+- Requires 3 colluding operators in the same DKG group (non-trivial).
+- A new DKG attempt with different group composition would bypass this.
+- The bug only affects the eligibility filter, not the exclusion itself.
+- In practice, if all operators have equal seat counts, the bug may not
+  manifest because double-counting j vs counting k gives the same result
+  (assuming uniform seat distribution).
+
+The bug is MOST impactful when operators have UNEQUAL seat counts
+(i.e., some operators hold more seats than others).
+
+=======================================================
+STEP 4: PRODUCTION USAGE
+=======================================================
+
+CONFIRMED ACTIVE. The function is called from:
+- pkg/tbtc/dkg_loop.go line 365: retry.EvaluateRetryParticipantsForKeyGeneration()
+
+This is used in the DKG (Distributed Key Generation) loop for tBTC v2
+wallet creation. tBTC v2 is actively in production with:
+- ~6,500 BTC TVL (peak 2025)
+- 26,355 BTC cumulative volume
+- 18,136+ holders
+- Active development through 2026
+
+keep-core is NOT deprecated. It is the active client powering tBTC v2.
+
+=======================================================
+STEP 5: IMMUNEFI SCOPE ANALYSIS
+=======================================================
+
+PROBLEMATIC. The Immunefi scope lists 52 assets, primarily:
+- Smart contracts (Solidity) across multiple chains
+- One website (threshold.network)
+- GitHub repo: keep-network/keep-core/tree/main/solidity/ecdsa#build
+  (specifically the SOLIDITY contracts, NOT the Go client)
+
+The Go client code (pkg/tecdsa/retry/retry.go) is NOT explicitly
+listed as an in-scope asset. The scope entry for keep-core points
+specifically to "solidity/ecdsa" not to the Go packages.
+
+HOWEVER, the program states: "If whitehats can demonstrate a critical
+impact on code in production for an asset not in scope, Threshold
+Network encourages you to submit your bug report and it will be
+assessed on a case-by-case basis."
+
+This is a Primacy of Rules program, so out-of-scope assets are NOT
+guaranteed a reward but MAY be considered.
+
+=======================================================
+STEP 6: SEVERITY ASSESSMENT
+=======================================================
+
+The claimed severity is MEDIUM (DoS on wallet creation).
+
+My assessment: LOW to MEDIUM.
+
+Arguments for MEDIUM:
+- Real bug, real production code
+- Can theoretically prevent triplet exclusion from working correctly
+- DKG is critical for tBTC wallet creation
+
+Arguments for LOW:
+- Only affects the eligibility filter, not the exclusion mechanism itself
+- With uniform seat distribution (common case), the bug may be a no-op
+  since double-counting j gives same result as counting k
+- Requires 3 colluding operators in same group
+- System can re-attempt with new group composition
+- Single and pair exclusion still work correctly
+- No direct fund loss
+
+=======================================================
+VERDICT: CONFIRMED (bug exists) but WEAK SUBMISSION
+=======================================================
+
+Evidence:
+1. Bug exists at line 308: YES - confirmed independently
+2. Copy-paste error confirmed: YES - clear pattern from pair function
+3. Impact is real: PARTIALLY - the bug is real but the practical impact
+   is limited. The claim of "permanent" DoS is overstated. The system
+   has fallback mechanisms and the bug only matters with non-uniform
+   seat distributions.
+4. In scope: NO - Go client code is NOT in the explicit scope. Would
+   need to rely on the case-by-case exception clause.
+5. Severity: LOW-MEDIUM (not MEDIUM as claimed)
+
+Recommendation: SUBMIT WITH CAVEATS
+
+The bug is genuine and the code analysis is sound. However:
+
+1. The submission should be HONEST about scope limitations. The Go
+   client is not explicitly in scope. Frame it under the "critical
+   impact on production code" exception clause.
+
+2. The severity claim should be toned down. "Permanent DoS" is
+   overstated. Say "degraded retry effectiveness for triplet exclusion"
+   instead.
+
+3. Include a concrete proof of concept showing a specific operator
+   seat distribution where the bug causes incorrect filtering.
+   Without this, the report is just a code observation.
+
+4. The fix is trivial (change operators[j] to operators[k] on line 308),
+   which is good - it demonstrates the issue is clearly unintentional.
+
+5. Expected payout: LOW. Even if accepted, this is likely to be
+   assessed at Low severity ($1K-$5K range) given it's:
+   (a) out of explicit scope
+   (b) requires specific conditions to manifest
+   (c) no direct fund loss
+   (d) DoS is not permanent
+
+RISK: High chance of rejection as "out of scope" despite the bug
+being real. The Primacy of Rules designation works against you here.

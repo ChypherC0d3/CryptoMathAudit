@@ -1,0 +1,84 @@
+Firedancer H6 Differential Test -- Valid Vectors Results
+========================================================
+Date: 2026-03-28
+
+Test: Ed25519 signature verification differential test
+       Reference backend (minimal) vs AVX512 backend (icelake_wsl)
+       AVX512 run under Intel SDE 9.44.0 with -icl (icelake emulation)
+
+Vectors: 1300 valid Ed25519 signatures from valid_vectors.json (530KB)
+         All vectors are valid signatures that pass ed25519-dalek verify.
+         Crafted to target field arithmetic boundaries in r43x6 limb representation.
+
+Source: /tmp/firedancer (Firedancer repo, built with MACHINE=linux_gcc_minimal and icelake_wsl)
+Test:   F:\Claude\BugBounty\targets\firedancer\h6_test\test_h6_valid.c
+        (patched to properly initialize fd_sha512_t for fd_ed25519_verify)
+
+Compilation:
+  REF:    gcc -O2 -I src -I src/ballet/ed25519 -I src/ballet/sha512 -DNDEBUG
+          Linked: build/linux/gcc/minimal/lib/libfd_ballet.a libfd_util.a
+  AVX512: gcc -O2 -I src -I src/ballet/ed25519 -I src/ballet/sha512 -DNDEBUG
+          -DFD_HAS_AVX512=1 -mavx512f -mavx512vl -mavx512bw -mavx512ifma
+          Linked: build/linux/gcc/icelake_wsl/lib/libfd_ballet.a libfd_util.a
+
+========================================
+RESULTS
+========================================
+
+Reference backend (minimal):
+  Total:    1300
+  Accepted: 1300
+  Rejected: 0
+  Mismatch: 0 (all expected=1 matched got=1)
+
+AVX512 backend (icelake_wsl, under SDE -icl):
+  Total:    1300
+  Accepted: 1300
+  Rejected: 0
+  Mismatch: 0 (all expected=1 matched got=1)
+
+diff ref_results.txt avx_results.txt:
+  EXIT CODE: 0 (no differences)
+  ZERO differences between reference and AVX512 outputs.
+
+========================================
+CATEGORY BREAKDOWN (all 1300 passed both backends)
+========================================
+  200  random           -- uniformly random valid signatures
+  200  R_diversity      -- diverse R-point coordinates
+  100  y_low_bits       -- pubkey y near 0
+  100  y_limb_carry     -- pubkey y near r43x6 limb boundaries
+  100  y_high_bits      -- pubkey y near p (2^255 - 19)
+  100  multi_msg        -- multiple messages per key
+  100  R_low_bits       -- R-point y near 0
+  100  R_limb_carry     -- R-point y near limb boundaries
+  100  R_high_bits      -- R-point y near p
+   50  y_alt_bits       -- pubkey alternate bit patterns
+   50  long_msg         -- longer messages
+   50  S_limb_edge      -- S scalar near limb edges
+   50  R_alt_bits       -- R-point alternate bit patterns
+
+========================================
+CONCLUSION
+========================================
+
+No differential bug found with these 1300 valid vectors.
+
+Both the reference and AVX512 backends accept all 1300 valid signatures
+identically. The field arithmetic boundary vectors (limb carry, high/low
+bits near p and 0) did not trigger any divergence.
+
+This does NOT rule out bugs -- the AVX512 field arithmetic could still
+diverge on:
+  - Invalid/malformed signatures (reject vs accept divergence)
+  - Specific bit patterns not covered by these categories
+  - Edge cases in the group equation check (not just decompression)
+  - Batch verification paths
+
+Next steps:
+  - Test with INVALID vectors (signatures that should be rejected)
+  - Test batch verification (fd_ed25519_verify_batch_single_msg)
+  - Generate vectors targeting specific AVX512 r43x6 limb overflow patterns
+  - Try fuzzing with random mutations of valid signatures
+
+Bug bounty value: $0 (no bug found with this vector set)

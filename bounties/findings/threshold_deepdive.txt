@@ -1,0 +1,384 @@
+================================================================================
+THRESHOLD NETWORK / tBTC v2 - DEEP SECURITY AUDIT FINDINGS
+================================================================================
+Date: 2026-03-28
+Target: Threshold Network (tBTC v2)
+Bug Bounty: Immunefi - https://immunefi.com/bug-bounty/thresholdnetwork/
+Max Payout: $150,000 (Critical: 10% of funds at risk, min $10K max $150K)
+KYC Required: No
+
+================================================================================
+SECTION 1: ARCHITECTURE OVERVIEW
+================================================================================
+
+Repositories Analyzed:
+  - https://github.com/keep-network/tbtc-v2 (Bridge, smart contracts)
+  - https://github.com/threshold-network/keep-core (tECDSA client, DKG, signing)
+  - https://github.com/keep-network/keep-ecdsa (Legacy, for context)
+
+Protocol: GG18/GG19 (Gennaro-Goldfeder 2018/2019)
+  - Based on: bnb-chain/tss-lib v1.3.5
+  - Forked to: github.com/threshold-network/tss-lib v0.0.0-20230901144531-2e712689cfbe
+  - Threshold: 51-of-100 (groupThreshold=51, activeThreshold=90, groupSize=100)
+  - Curve: secp256k1
+
+Key Components:
+  - DKG (Distributed Key Generation): 4 TSS rounds + ephemeral key exchange
+    File: keep-core/pkg/tecdsa/dkg/
+  - Signing: 9 TSS rounds + ephemeral key exchange
+    File: keep-core/pkg/tecdsa/signing/
+  - On-chain: WalletRegistry (EcdsaDkgValidator), Bridge, Fraud detection
+    Files: keep-core/solidity/ecdsa/, tbtc-v2/solidity/contracts/bridge/
+  - Cross-chain: Wormhole-based L2 gateways for Arbitrum, Base, Optimism, Polygon, Solana, Starknet, Sui
+    File: tbtc-v2/solidity/contracts/cross-chain/
+
+Communication Model:
+  - Broadcast channel for public messages
+  - P2P messages encrypted with ephemeral ECDH-derived symmetric keys (AES)
+  - Ephemeral keys generated per session on secp256k1 (btcec)
+  - Session IDs used to prevent cross-session message confusion
+
+================================================================================
+SECTION 2: CONFIRMED BUG - RETRY TRIPLET EXCLUSION (copy-paste error)
+================================================================================
+
+Severity: MEDIUM (off-chain client logic, affects DKG reliability under adversary)
+File: keep-core/pkg/tecdsa/retry/retry.go
+Line: 308
+
+BUG DESCRIPTION:
+In the `excludeOperatorTriplets` function, the variable `rightOperator` is
+assigned `operators[j]` instead of `operators[k]`. This is a copy-paste error
+from the `excludeOperatorPairs` function above.
+
+AFFECTED CODE (line 306-308):
+    leftOperator := operators[i]
+    middleOperator := operators[j]
+    rightOperator := operators[j]    // BUG: should be operators[k]
+
+CORRECT CODE should be:
+    leftOperator := operators[i]
+    middleOperator := operators[j]
+    rightOperator := operators[k]    // FIXED
+
+IMPACT:
+1. The triplet exclusion degenerates into pair exclusion - the third operator
+   in every triplet is always the same as the second (middleOperator), meaning
+   only 2 unique operators are ever excluded when 3 should be.
+
+2. This means the DKG retry mechanism cannot properly isolate a malicious
+   triplet of operators. If 3 colluding operators are disrupting DKG, the
+   retry mechanism will never successfully exclude all 3 simultaneously,
+   causing repeated DKG failures.
+
+3. Additionally, the seat count calculation on lines 313-316 double-counts
+   middleOperator's seats (once as middleOperator, once as rightOperator),
+   which corrupts the eligibility filter. Some triplets that should be
+   eligible for exclusion will be incorrectly filtered out, and some that
+   should be filtered out will pass through.
+
+4. The filtering on lines 332-334 also only excludes 2 unique operators
+   instead of 3, so even when a "triplet" is selected, only a pair is
+   actually removed from participation.
+
+EXPLOITABILITY:
+A group of 3 colluding malicious operators could permanently disrupt DKG by
+sending corrupted messages. The retry mechanism would cycle through singles
+and pairs but never successfully exclude the malicious triplet, eventually
+exhausting all retries and failing DKG entirely. This is a denial-of-service
+against wallet creation.
+
+NOTE ON BOUNTY ELIGIBILITY:
+This is in the off-chain client code (keep-core), which may or may not be
+in-scope for the Immunefi bounty (the scope focuses on smart contracts).
+However, the impact is on the protocol's liveness. Worth submitting as
+informational/low with a case for medium impact.
+
+================================================================================
+SECTION 3: TSS-LIB DEPENDENCY ANALYSIS
+================================================================================
+
+CRITICAL CONCERN: Outdated tss-lib Fork
+
+The keep-core project uses a FORKED version of tss-lib:
+  go.mod replace: github.com/bnb-chain/tss-lib => github.com/threshold-network/tss-lib v0.0.0-20230901144531-2e712689cfbe
+
+This fork is based on tss-lib v1.3.5 with custom patches. The date
+(2023-09-01) suggests it was patched after the major CVE disclosures in
+mid-2023, but it is NOT based on tss-lib v2.0.0.
+
+Known CVEs affecting bnb-chain/tss-lib pre-v2.0.0:
+
+a) CVE-2023-33241 (Fireblocks - Paillier Key Vulnerability) - CRITICAL
+   An attacker can extract the full ECDSA private key by injecting a
+   malicious Paillier key with small factors and cheating range proofs.
+   Requires ~16 signing sessions to fully exfiltrate key shares.
+   STATUS: The fork date (Sept 2023) is after Fireblocks disclosure (Aug 2023),
+   suggesting it MAY include the fix. However, the fork does not track
+   upstream v2.0.0 which has the comprehensive fix. NEEDS VERIFICATION.
+
+b) TSSHOCK (Verichains) - Key Extraction via Ambiguous Encoding - CRITICAL
+   New key extraction attacks on GG18/GG20 implementations through
+   ambiguous protobuf encoding of TSS messages.
+   STATUS: The fork predates some TSSHOCK patches. NEEDS VERIFICATION.
+
+c) CVE-2023-26556 / CVE-2023-26557 - Timing Side-Channel Attacks - MEDIUM
+   Non-constant-time scalar multiplication and big.Int operations can leak
+   private key material through timing analysis.
+   STATUS: These are inherent to Go's crypto/elliptic and big.Int libraries.
+   The fork likely does NOT fully mitigate these.
+
+d) Session ID (ssid) Not Used - LOW/MEDIUM
+   In pre-v2.0.0 tss-lib, the session ID parameter is not propagated into
+   sub-protocol ZK proofs, making message replay/spoofing easier.
+   STATUS: The keep-core wrapper adds its own sessionID checking at the
+   application layer (see states.go message filtering), which provides
+   partial mitigation.
+
+RECOMMENDATION:
+Verify whether the threshold-network/tss-lib fork at commit 2e712689cfbe
+includes specific patches for CVE-2023-33241 and TSSHOCK. If not, this
+represents a critical vulnerability in the live tBTC system. The upstream
+bnb-chain/tss-lib v2.0.0 includes comprehensive fixes.
+
+================================================================================
+SECTION 4: PROTOCOL-LEVEL ANALYSIS
+================================================================================
+
+4.1 ROGUE-KEY ATTACKS
+Assessment: MITIGATED by tss-lib internals
+
+The GG18 protocol includes Schnorr-style proofs of knowledge during the
+DKG key generation phase. The tss-lib library handles these internally.
+Each participant must prove knowledge of their secret share, preventing
+a malicious party from choosing their share as a function of other parties'
+shares (the classic rogue-key attack vector).
+
+The keep-core wrapper correctly uses tss-lib's built-in validation
+(PreParams.data.ValidateWithProof() is called when loading from disk).
+
+4.2 NONCE HANDLING (MtA Conversion)
+Assessment: DELEGATED TO TSS-LIB
+
+The Multiplicative-to-Additive (MtA) protocol is handled entirely within
+tss-lib's signing rounds. The keep-core code is a thin wrapper that
+serializes/deserializes messages and manages the state machine. The MtA
+security depends on the Paillier encryption parameters - see CVE-2023-33241
+analysis above.
+
+4.3 PAILLIER ENCRYPTION VALIDATION
+Assessment: PARTIALLY MITIGATED
+
+PreParams are validated using ValidateWithProof() when loaded from disk
+(preparams.go line 225). This validates the Paillier modulus properties.
+However, the validation strength depends on which version of the proof is
+implemented in the fork. The v2.0.0 tss-lib added significantly stronger
+Paillier-Blum Modulus ZK proofs.
+
+The PreParams pool generates parameters asynchronously and persists them
+to disk. There is a time-of-check-time-of-use (TOCTOU) window between
+generation and use, but since the parameters are generated locally and
+not received from the network, this is not exploitable by external parties.
+
+4.4 ABORT ATTACKS / INFORMATION LEAKAGE
+Assessment: LOW RISK (with caveats)
+
+The protocol handles aborts gracefully - if a round times out or a party
+sends invalid data, the protocol aborts and retries with a different subset
+of participants. The retry mechanism (retry.go) attempts to isolate
+misbehaving parties by progressively excluding operators.
+
+HOWEVER: The triplet exclusion bug (Section 2) weakens this defense.
+A coordinated group of 3+ malicious operators can cause indefinite DKG
+failures without being isolated.
+
+For signing, the retry mechanism randomly selects subsets of size >= 51
+from the 100-member group. This is simpler and does not have the triplet
+bug.
+
+4.5 REPLAY / REUSE ATTACKS
+Assessment: MITIGATED
+
+Session IDs are checked at every message reception point:
+  - DKG states.go: checks `ekpgs.member.sessionID == protocolMessage.SessionID()`
+  - Signing states.go: same pattern
+  - Result signing: checks sessionID AND public key match
+
+Messages are deduplicated per sender per round (receivedMessages generic
+function uses sender ID for deduplication).
+
+Ephemeral key pairs are generated fresh per session, and symmetric keys
+derived from them are unique per session pair.
+
+4.6 COMMITMENT SCHEME ANALYSIS
+Assessment: DELEGATED TO TSS-LIB
+
+The Pedersen commitments and decommitments are handled within the tss-lib
+library (DKG Round 1 = commitments, Round 2 = decommitments). The keep-core
+wrapper treats these as opaque byte arrays. Security depends on the tss-lib
+implementation.
+
+================================================================================
+SECTION 5: SMART CONTRACT ANALYSIS
+================================================================================
+
+5.1 DKG RESULT VALIDATION (EcdsaDkgValidator.sol)
+Assessment: WELL STRUCTURED
+
+The validator performs multi-layered checks:
+  - Field format validation (public key length, signature sizes, array ordering)
+  - Group member verification against sortition pool selection
+  - ECDSA signature verification of DKG result hash
+  - Members hash validation (filtering misbehaved members)
+  - Chain ID included in the signed hash (prevents cross-chain replay)
+
+The signature hash includes block.chainid (line 222), which prevents cross-
+chain DKG result replay on different EVM chains.
+
+OBSERVATION: The misbehavedMembersIndices validation (lines 128-143) only
+checks that a single-element array has index >= 1 implicitly through the
+multi-element check. For a single misbehaved member, neither the range check
+(line 129-131) nor the ascending order check (line 135-142) execute. This is
+correct because the groupSize - 1 >= activeThreshold check on line 124 still
+applies, and the validateMembersHash function on line 270 will validate the
+indices are within bounds when constructing groupMembers.
+
+5.2 FRAUD CHALLENGE SYSTEM (Fraud.sol)
+Assessment: SOLID
+
+Key security properties:
+  - Sighash is computed on-chain from preimageSha256, preventing signature forgery
+  - Challenge key is unique per (walletPublicKey, sighash) pair
+  - SIGHASH_ALL type is enforced (only type value 1 accepted)
+  - Heartbeat messages are 16 bytes (too short to be valid Bitcoin tx preimage)
+  - ETH deposit required to prevent spam challenges
+
+One minor observation: The resolveFraudChallenge function (line 335) uses a
+low-level call with gas limit of 100000 to send ETH to treasury. If treasury
+is a contract that requires more gas, the call will silently fail. This is a
+known pattern (Slither already flagged it) and is intentional to prevent
+reentrancy.
+
+5.3 HEARTBEAT MESSAGE FORMAT (Heartbeat.sol)
+Assessment: SECURE
+
+The heartbeat message format (16 bytes, first 8 bytes = 0xffffffffffffffff)
+is carefully designed to be shorter than any valid Bitcoin transaction
+preimage (minimum 48 bytes). This ensures that a heartbeat signature can
+never be confused with a transaction signature, providing clean separation
+between the two signature domains.
+
+5.4 DEPOSIT SCRIPT SECURITY
+Assessment: SOUND
+
+The deposit script uses a standard P2SH/P2WSH pattern with depositor address
+and blinding factor for uniqueness. The refund path includes CHECKLOCKTIMEVERIFY
+for time-locked refunds. The script structure prevents common Bitcoin script
+vulnerabilities.
+
+================================================================================
+SECTION 6: CROSS-CHAIN BRIDGE ANALYSIS
+================================================================================
+
+6.1 L2WORMHOLEGATEWAGY - PREVIOUSLY EXPLOITED
+Assessment: PATCHED (October 2023 incident)
+
+The L2WormholeGateway was previously found to have a critical vulnerability
+where a small amount of L1 tBTC could be used to mint unlimited L2 tBTC on
+Arbitrum, Base, Optimism, and Polygon. This was patched by removing the
+`depositWormholeTbtc` function. The current version has a minting limit.
+
+6.2 CROSS-CHAIN SIGNATURE REPLAY
+Assessment: MITIGATED FOR DKG, INHERENT RISK FOR BITCOIN
+
+DKG results include block.chainid in the signature hash, preventing
+replay across EVM chains.
+
+For Bitcoin signatures, the same threshold signing group produces Bitcoin
+signatures. Since Bitcoin does not have chain IDs, the signature itself
+is valid across any Bitcoin-compatible chain (e.g., Bitcoin, Bitcoin Cash,
+Litecoin if same curve). However, this is inherent to the Bitcoin protocol
+and not a bug in tBTC.
+
+The tBTC Bridge enforces SIGHASH_ALL, which commits to all inputs and
+outputs of a transaction, preventing signature reuse across different
+transactions.
+
+6.3 CHAIN-SPECIFIC FORMAT CONCERNS
+Assessment: LOW RISK
+
+The EcdsaLib.compressPublicKey function (EcdsaLib.sol) correctly handles
+the Y coordinate parity prefix (02/03). The signature format (R, S, V)
+is chain-agnostic in the Signature struct and adapted per-chain in the
+client code.
+
+================================================================================
+SECTION 7: KNOWN HISTORICAL INCIDENTS
+================================================================================
+
+1. September-October 2023: Crafted BTC transactions blocking redemptions
+   - An unknown party sent specially crafted BTC to tBTC wallets
+   - Signing clients treated wallets as "busy", blocking redemptions
+   - Two bugs exposed, neither put funds at risk
+   - Patched and released
+   Source: https://blog.threshold.network/a-tale-of-two-bugs/
+
+2. October 2023: L2WormholeGateway Critical Vulnerability
+   - Reported via Immunefi bug bounty
+   - Small L1 tBTC could mint unlimited L2 tBTC on 4 chains
+   - Fixed by removing vulnerable function
+   Source: https://blog.threshold.network/retro-l2-wormholegateway-crit/
+
+3. No publicly reported incidents in 2024-2025.
+
+================================================================================
+SECTION 8: ACTIONABLE FINDINGS SUMMARY
+================================================================================
+
+FINDING 1: Retry Triplet Exclusion Bug (MEDIUM)
+  File: keep-core/pkg/tecdsa/retry/retry.go:308
+  Bug: operators[j] should be operators[k]
+  Impact: DKG retry cannot isolate malicious triplets of operators
+  Bounty potential: LOW-MEDIUM (off-chain code, DoS impact)
+
+FINDING 2: Outdated tss-lib Fork (HIGH concern, needs verification)
+  File: keep-core/go.mod (replace directive)
+  Issue: Fork based on v1.3.5 era code, not v2.0.0
+  Impact: Potentially vulnerable to CVE-2023-33241, TSSHOCK, timing attacks
+  Bounty potential: HIGH if CVE patches are missing; likely already patched
+  Next step: Inspect fork commit 2e712689cfbe for specific CVE patches
+
+FINDING 3: Non-constant-time operations in Go stdlib (LOW)
+  Issue: Go's crypto/elliptic and math/big are not constant-time
+  Impact: Theoretical timing side-channel in TSS computations
+  Bounty potential: LOW (extremely hard to exploit in practice for network protocol)
+
+FINDING 4: Insecure RNG in retry logic (INFORMATIONAL)
+  File: keep-core/pkg/tecdsa/retry/retry.go:60
+  Issue: Uses math/rand with predictable seed (hash of message + retry count)
+  Impact: Retry participant selection is deterministic and predictable
+  Note: This is intentional - all operators must agree on the same selection.
+  The comment explicitly acknowledges this (#nosec G404).
+
+================================================================================
+SECTION 9: BOUNTY SUBMISSION RECOMMENDATIONS
+================================================================================
+
+Priority 1 (Submit immediately if verified):
+  - TSS-lib fork CVE status verification. If CVE-2023-33241 or TSSHOCK
+    patches are missing, this is Critical ($10K-$150K).
+
+Priority 2 (Submit as bug report):
+  - Retry triplet exclusion bug. Clear copy-paste error with demonstrable
+    impact on DKG reliability. Likely Low-Medium ($1K-$2K if in scope).
+
+Priority 3 (Monitor/Research further):
+  - Deep-dive into the threshold-network/tss-lib fork to diff against
+    upstream patches for all 4 CVEs.
+  - Fuzz the protobuf message deserialization in UpdateFromBytes paths.
+  - Analyze the ephemeral key encryption (AES via keep-common/pkg/encryption)
+    for authenticated encryption guarantees.
+
+================================================================================
+END OF REPORT
+================================================================================

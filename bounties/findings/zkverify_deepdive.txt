@@ -1,0 +1,354 @@
+================================================================================
+ZKVERIFY DEEP SECURITY AUDIT - FINDINGS REPORT
+================================================================================
+
+Date:       2026-03-28
+Target:     zkVerify (https://github.com/zkVerify/zkVerify.git)
+Bounty:     Immunefi - up to $50K (Critical $15K-$50K, High $5K-$10K)
+Auditors:   Trail of Bits (Feb 2025), SRLabs (Sep 2025)
+Scope:      https://immunefi.com/bug-bounty/zkverify/
+
+================================================================================
+ARCHITECTURE OVERVIEW
+================================================================================
+
+zkVerify is a Substrate relay chain specialized for ZK proof verification.
+Core flow: user submits proof -> verifier pallet verifies -> statement hash
+emitted -> aggregate pallet collects for cross-chain dispatch.
+
+Verifiers found (9 total):
+  1. Groth16 (BN254, BLS12-381) - verifiers/groth16/
+  2. Fflonk                     - verifiers/fflonk/
+  3. UltraPlonk                 - verifiers/ultraplonk/
+  4. UltraHonk (V0.84, V3.0)   - verifiers/ultrahonk/
+  5. Risc0 (V2.1-V3.0)         - verifiers/risc0/
+  6. SP1                        - verifiers/sp1/
+  7. Plonky2                    - verifiers/plonky2/
+  8. EZKL                       - verifiers/ezkl/
+  9. TEE (Intel SGX, Nitro)     - verifiers/tee/
+
+NOTE: "Halo2 verifier" and "Proofofsql verifier" from the initial target list
+were NOT found in the current codebase. EZKL and TEE are present instead.
+
+Native crypto acceleration: native/src/ (BN254 accelerated pairing, Groth16
+native, Risc0 Poseidon2 native).
+
+================================================================================
+FINDING 1 [HIGH/CRITICAL] - Fflonk VK Fr Field Conversion Panic (Node DoS)
+================================================================================
+
+File: verifiers/fflonk/src/vk.rs:54-57
+Code:
+    impl From<Fr> for substrate_bn::Fr {
+        fn from(value: Fr) -> Self {
+            substrate_bn::Fr::from_slice(&value.0.into_bytes())
+                .expect("BUG: should be hardcoded. qed")
+        }
+    }
+
+ISSUE: The Fflonk VK contains user-controlled Fr fields (k1, k2, w, w3, w4,
+w8, wr). These are converted via From<Fr> which calls .expect() -- a PANIC if
+the value exceeds the BN254 scalar field modulus.
+
+This code is reachable through TWO paths:
+  1. validate_vk() -> Vk::try_into() [checked G1/G2, but panics on Fr]
+  2. verify_proof() -> Vk::try_into_fflonk_vk_unchecked() [same Fr conversion]
+
+Both paths use the same `From<Fr>` impl that panics on out-of-range values.
+
+ATTACK: Submit a Fflonk VK with any Fr field set to a value >= BN254 Fr
+modulus (e.g., k1 = 0xFFFF...FFFF). This triggers a panic in the runtime,
+which in a Substrate chain would cause the block to fail to execute.
+
+The comment "BUG: should be hardcoded. qed" suggests the developer assumed
+these values would always be valid, but the VK is user-supplied.
+
+SEVERITY: HIGH - DoS of block production. Could be CRITICAL if:
+  - The panic happens during block execution (not just transaction processing)
+  - Substrate doesn't catch panics in transaction execution for this code path
+
+REMEDIATION: Change the From<Fr> impl to TryFrom<Fr> returning a proper error,
+and update both try_into() and try_into_fflonk_vk_unchecked() to propagate
+the error instead of panicking.
+
+================================================================================
+FINDING 2 [MEDIUM] - Groth16 VK Unchecked Deserialization in verify_proof
+================================================================================
+
+File: primitives/hp-groth16/src/lib.rs:77-81
+Code:
+    pub fn verify_proof<E: Pairing>(
+        vk: VerificationKey, proof: Proof, inputs: &[Scalar],
+    ) -> Result<bool, Groth16Error> {
+        let proof: ark_groth16::Proof<E> =
+            proof.try_into().map_err(|_| Groth16Error::InvalidProof)?;
+        let vk: ark_groth16::VerifyingKey<E> = vk
+            .try_into_ark_unchecked()   // <--- UNCHECKED
+            .map_err(|_| Groth16Error::InvalidVerificationKey)?;
+
+File: primitives/hp-groth16/src/data_structures.rs:179-193
+Code:
+    pub fn try_into_ark_unchecked<E: Pairing>(self) -> Result<...> {
+        Ok(ark_groth16::VerifyingKey {
+            alpha_g1: self.alpha_g1.try_into_affine_unchecked()?,  // NO on-curve check
+            beta_g2: self.beta_g2.try_into_affine_unchecked()?,    // NO on-curve check
+            gamma_g2: self.gamma_g2.try_into_affine_unchecked()?,  // NO on-curve check
+            delta_g2: self.delta_g2.try_into_affine_unchecked()?,  // NO on-curve check
+            gamma_abc_g1: ... .try_into_affine_unchecked()?,       // NO on-curve check
+        })
+    }
+
+ISSUE: During verify_proof(), the VK is deserialized with
+deserialize_uncompressed_unchecked(), which skips on-curve and subgroup
+checks. The proof points ARE checked (uses try_into_affine with full checks).
+
+MITIGATING FACTORS:
+  - validate_vk() uses the CHECKED path (TryFrom<VerificationKey> for
+    ark_groth16::VerifyingKey which calls deserialize_uncompressed WITH checks)
+  - When VK is passed by hash (pre-registered), it was validated at
+    register_vk() time
+  - When VK is passed inline, validate_vk() is called BEFORE verify_proof()
+    in the submit_proof extrinsic (pallet/verifiers/src/lib.rs:373)
+
+RESIDUAL RISK: This is a defense-in-depth concern. The design INTENTIONALLY
+uses unchecked VK deserialization in verify_proof for performance (avoiding
+double validation). However:
+  - If validate_vk is ever bypassed or weakened, off-curve VK points could
+    lead to invalid proof acceptance
+  - The pattern of "validate once, use unchecked later" is fragile to
+    refactoring
+
+SEVERITY: MEDIUM (informational given mitigations, but worth flagging)
+
+================================================================================
+FINDING 3 [MEDIUM] - Fflonk VK Unchecked Point Deserialization in verify_proof
+================================================================================
+
+File: verifiers/fflonk/src/lib.rs:55-59
+Code:
+    fn verify_proof(vk, raw_proof, raw_pubs) {
+        let vk: fflonk_verifier::VerificationKey = vk
+            .clone()
+            .try_into_fflonk_vk_unchecked()  // <--- UNCHECKED for G1/G2
+            .map_err(|_| VerifyError::InvalidVerificationKey)?;
+
+File: verifiers/fflonk/src/vk.rs:104-110 and 128-134
+    G1::try_into_substrate_bn_unchecked() and G2::try_into_substrate_bn_unchecked()
+    These skip the AffineG1::new / AffineG2::new on-curve validation.
+
+ISSUE: Same pattern as Groth16 - verify_proof uses unchecked G1/G2
+deserialization for performance, relying on validate_vk to have run first.
+
+MITIGATING FACTORS:
+  - validate_vk() uses the checked path (try_into() with AffineG1::new check)
+  - The pallet framework calls validate_vk before verify_proof for inline VKs
+
+SEVERITY: MEDIUM (same defense-in-depth concern as Finding 2)
+
+================================================================================
+FINDING 4 [MEDIUM] - EZKL VK Validation is Purely Length-Based
+================================================================================
+
+File: verifiers/ezkl/src/lib.rs:125-134
+Code:
+    fn validate_vk(vk: &Self::Vk) -> Result<(), VerifyError> {
+        if vk.vk_bytes.is_empty()
+            || vk.vk_bytes.len() & 31 != 0
+            || vk.vk_bytes.len() > MAX_VK_LENGTH as usize
+        {
+            return Err(VerifyError::InvalidVerificationKey);
+        }
+        Ok(())
+    }
+
+ISSUE: The EZKL verifier's validate_vk only checks that the VK bytes are:
+  - Not empty
+  - Length is a multiple of 32
+  - Length <= 9216 bytes
+
+It does NOT validate:
+  - That the bytes decode to valid curve points
+  - That the VK structure is well-formed
+  - Any cryptographic properties
+
+This means ANY arbitrary bytes of valid length can be registered as a VK.
+The actual VK parsing only happens during verify_proof inside ezkl_no_std::verify.
+
+IMPACT: An attacker can register garbage VKs that occupy storage and lock
+deposit funds. If ezkl_no_std::verify has any parsing bugs with malformed VKs,
+those would not be caught at registration time.
+
+POST-AUDIT NOTE: This was likely added after the SRLabs audit (Sep 2025).
+The EZKL verifier was specifically called out as unaudited attack surface.
+
+SEVERITY: MEDIUM
+
+================================================================================
+FINDING 5 [LOW] - Plonky2 compute_weight Panic on degree_bits == 0
+================================================================================
+
+File: verifiers/plonky2/src/lib.rs:203-323
+Code:
+    fn compute_weight<T: Config>(degree_bits: usize, config: ...) -> Weight {
+        match (degree_bits, config) {
+            (1, Poseidon) => ...,
+            (1, Keccak) => ...,
+            // ... cases for 1-19
+            _ => panic!("Invalid value given for degree_bits."),
+        }
+    }
+
+ISSUE: If a VK with degree_bits == 0 passes validation (validate_vk_inner
+only checks degree_bits <= 19, not >= 1), then verify_proof would panic
+when computing the post-dispatch weight.
+
+MITIGATING FACTOR: It's unclear whether plonky2's FRI params can have
+degree_bits == 0. In practice, FRI requires degree_bits >= 1. However, the
+explicit check is missing.
+
+SEVERITY: LOW (likely not reachable in practice, but the guard is missing)
+
+================================================================================
+FINDING 6 [INFORMATIONAL] - Accelerated BN254 Uses Validate::No for SCALE
+================================================================================
+
+File: native/src/accelerated_bn/utils.rs:32
+Code:
+    const SCALE_USAGE: u8 = ark_scale::make_usage(Compress::No, Validate::No);
+
+ISSUE: The accelerated BN254 host function bridge uses Validate::No for SCALE
+deserialization. This means curve points crossing the WASM<->native boundary
+via host calls are NOT validated after deserialization.
+
+MITIGATING FACTORS:
+  - The points were already validated in the WASM runtime before being sent
+    to the host function
+  - The host functions are only called from the runtime, not directly by users
+
+SEVERITY: INFORMATIONAL - No direct exploit, but adds to the attack surface
+if there's any way to inject untrusted data into the host function pipeline.
+
+================================================================================
+FINDING 7 [INFORMATIONAL] - SP1 and Risc0 Use Default validate_vk (No-Op)
+================================================================================
+
+SP1 (verifiers/sp1/src/lib.rs): Does NOT override validate_vk(). The default
+implementation in traits accepts all VKs (returns Ok(())).
+
+Risc0 (verifiers/risc0/src/lib.rs): Also does NOT override validate_vk().
+
+This means ANY H256 can be registered as a VK for SP1 and Risc0.
+
+MITIGATING FACTOR: For SP1 and Risc0, the VK is just a hash (H256), not a
+structured cryptographic object. Validation at verify_proof time is sufficient
+because there's no expensive on-curve checking to skip. Invalid VK hashes
+simply won't match any valid proof.
+
+SEVERITY: INFORMATIONAL - By design for hash-based VKs, but worth noting.
+
+================================================================================
+FINDING 8 [LOW] - Statement Hash Context Separation
+================================================================================
+
+The statement hash formula is:
+  keccak256(keccak256(context) || vk_hash || verifier_version_hash || keccak256(pubs))
+
+Each verifier has a unique context string (b"groth16", b"fflonk", etc.) and
+potentially a version hash. This is well-designed for domain separation.
+
+HOWEVER: The Risc0 verifier has multiple versions (V1.0 through V3.0) with
+different version hashes but some versions are marked #[unsupported]. The
+unsupported versions still have version hashes defined. If an unsupported
+version proof is somehow deserialized (via a codec bypass), it would produce
+a valid-looking statement hash for an unverifiable proof.
+
+SEVERITY: LOW - Requires codec bypass which is extremely unlikely.
+
+================================================================================
+FINDING 9 [MEDIUM] - Weight Undercharging via Proof/VK Version Mismatch
+================================================================================
+
+File: verifiers/ultrahonk/src/lib.rs:365-385
+For pre-dispatch weight estimation, UltraHonk charges the MAXIMUM weight
+for the declared protocol version. However:
+
+For V0.84: charges fixed weight based on ProofType (ZK vs Plain)
+For V3.0: charges worst-case log_circuit_size=25
+
+File: verifiers/ultrahonk/src/lib.rs:247-276
+The verify_proof function checks proof/vk version match and returns
+VerifyError if mismatched. But the pre-dispatch weight is computed from
+the PROOF version (line 371-384), not the VK version.
+
+POTENTIAL ISSUE: If someone submits a V3_0 proof with a V0_84 VK:
+  - Pre-dispatch weight is charged based on V3.0 (expensive)
+  - The version check fails immediately at line 272-275
+  - The actual weight consumed is minimal
+
+This is the OPPOSITE of undercharging (overcharging on failure), so it's
+not exploitable for weight griefing in the usual sense. Actually safe.
+
+REVISED SEVERITY: INFORMATIONAL (false alarm on deeper analysis)
+
+================================================================================
+SCOPE & AUDIT COVERAGE ANALYSIS
+================================================================================
+
+Previously Audited (Trail of Bits, Feb 2025):
+  - Groth16, Fflonk, UltraPlonk, Risc0, SP1, Plonky2 verifiers
+  - Pallet-verifiers framework
+  - Aggregate pallet
+  - Native host functions
+
+Previously Audited (SRLabs, Sep 2025):
+  - Runtime upgrade security
+  - Substrate-specific attack surfaces
+
+LIKELY UNAUDITED (added after both audits):
+  - EZKL verifier (pallet index 169) - HIGHEST PRIORITY
+  - TEE verifier (pallet index 170) - HIGH PRIORITY
+  - UltraHonk V3.0 (version upgrade with migration)
+  - Risc0 V2.3 and V3.0 versions
+  - Aggregate pallet V4 migrations
+
+================================================================================
+RECOMMENDATIONS FOR BUG BOUNTY SUBMISSION
+================================================================================
+
+MOST PROMISING FOR SUBMISSION:
+
+1. FINDING 1 (Fflonk Fr Panic) - This is the strongest finding.
+   A user-controlled VK with out-of-range Fr values causes a runtime panic.
+   In Substrate, a panic during transaction execution typically aborts the
+   transaction and the block builder handles it, but if it occurs during
+   block import, it could halt consensus. Need to verify whether Substrate
+   catches panics in this specific code path (native runtime interface call).
+
+   If this panic is NOT caught by Substrate's transaction execution sandbox,
+   it would be a CRITICAL node crash vulnerability.
+
+   To produce a PoC:
+   - Construct a Fflonk VK where k1.0 = U256::MAX
+   - Submit it via register_vk or submit_proof with inline VK
+   - The Fr::from conversion will panic
+
+2. EZKL VERIFIER - As an unaudited verifier, focus fuzzing on the
+   ezkl_no_std::verify function with crafted VK bytes that pass the
+   length checks but contain malformed curve points.
+
+3. PLONKY2 degree_bits=0 - Check if plonky2 crate allows constructing
+   a serialized VK with degree_bits=0 that passes deserialization but
+   triggers the compute_weight panic.
+
+LESS PROMISING:
+
+- The unchecked VK deserialization (Findings 2, 3) is intentional and
+  mitigated by the validate_vk call ordering. Breaking this would require
+  finding a bypass of the pallet-verifiers framework.
+
+- The Validate::No in accelerated BN254 (Finding 6) is within the
+  host function boundary and not directly exploitable.
+
+================================================================================
+END OF REPORT
+================================================================================

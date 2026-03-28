@@ -1,0 +1,453 @@
+================================================================================
+SP1 zkVM STARK/FRI PROOF SYSTEM - DEEP SECURITY AUDIT FINDINGS
+================================================================================
+Date: 2026-03-28
+Target: Succinct SP1 zkVM (latest main branch)
+Bounty: Code4rena - up to $150K USDC
+Repo: https://github.com/succinctlabs/sp1
+================================================================================
+
+TABLE OF CONTENTS
+-----------------
+1. Executive Summary
+2. Known Vulnerability History
+3. Architecture Overview
+4. Code Audit Findings
+5. Potential Attack Vectors (Requires Further Investigation)
+6. Bounty Scope & Rules
+7. Recommendations for Deeper Investigation
+
+================================================================================
+1. EXECUTIVE SUMMARY
+================================================================================
+
+SP1 is Succinct's zkVM that compiles arbitrary Rust programs (via RISC-V) into
+zero-knowledge proofs using STARK + recursive composition + SNARK wrapping.
+The system has a significant history of critical soundness bugs:
+
+- V3 had TWO critical soundness bugs (Jan 2025) allowing proof forgery
+- Plonky3 (now forked as "slop") had a critical FRI verifier bug (June 2025)
+- The codebase has undergone major refactoring (Plonky3 -> "slop", FRI -> Basefold)
+
+The current codebase (SP1 v5+, "Turbo") uses:
+- Basefold (multilinear PCS) instead of classic FRI
+- LogUp+GKR for permutation arguments (replacing the old septic curve approach)
+- Zerocheck (replacing DEEP-ALI / vanishing polynomial checks)
+- "slop" library as the underlying algebraic toolkit (fork of Plonky3)
+
+This audit identified several areas warranting deeper investigation that could
+yield bounty-eligible findings.
+
+================================================================================
+2. KNOWN VULNERABILITY HISTORY
+================================================================================
+
+2a. SP1 V3 Critical Bug #1: Missing chip_ordering Validation
+-------------------------------------------------------------
+Root cause: The STARK prover provides a HashMap called `chip_ordering` to
+map polynomial evaluation claims to chips. Prior to SP1 Turbo, the verifier
+did NOT validate that this mapping was correct. A malicious prover could
+supply incorrect openings of preprocessed commitments.
+
+Impact: Soundness break - could prove arbitrary false statements.
+
+Status: PATCHED in SP1 Turbo. The current code verifies chip ordering through
+the Merkle tree VK proof mechanism (vkey_proof.rs).
+
+Mitigating factor: The recursive verifier committed valid chip orderings into
+a Merkle tree, so compressed/on-chain proofs were NOT affected.
+
+2b. SP1 V3 Critical Bug #2: Incomplete Proof Flag
+---------------------------------------------------
+Root cause: The `is_complete` flag that signals proof completion was not
+properly enforced in all code paths.
+
+Status: PATCHED. The current `assert_complete()` function in complete.rs
+performs extensive boundary condition checks when is_complete=1.
+
+2c. SP1 V3 Critical Bug #3: Plonky3 Fiat-Shamir Missing Observation
+--------------------------------------------------------------------
+Root cause: In Plonky3, polynomial evaluation claims were batched using a
+random linear combination, but the individual evaluation claims were NOT
+observed into the Fiat-Shamir challenger before sampling the batching
+coefficient. This allowed incorrect polynomial evaluation claims to pass.
+
+Status: PATCHED. The current basefold verifier (basefold/mod.rs) observes
+all relevant values into the challenger before sampling challenges.
+
+2d. Plonky3 FRI Verifier Bug (June 2025)
+-----------------------------------------
+Root cause: Two bugs in Plonky3's FRI verifier discovered by @zlangley and
+@AngusGruen. Details: GHSA-f69f-5fx9-w9r9 (Plonky3), GHSA-6248-228x-mmvh
+(SP1). Affected all proof verification including on-chain verifiers.
+
+Status: PATCHED in SP1 V5.0.0. SP1 has since forked Plonky3 as "slop" and
+replaced FRI with Basefold.
+
+================================================================================
+3. ARCHITECTURE OVERVIEW
+================================================================================
+
+Key directories and their security relevance:
+
+crates/core/machine/src/     - RISC-V AIR constraints (soundness-critical)
+  alu/                       - ALU operations (add, sub, mul, divrem, shifts)
+  air/memory.rs              - Memory consistency constraints
+  control_flow/              - Branch/jump constraints
+  bytes/                     - Byte lookup table
+
+crates/recursion/circuit/src/ - Recursive proof composition (soundness-critical)
+  machine/core.rs            - Core recursive verifier
+  machine/compress.rs        - Compress verifier (aggregates proofs)
+  machine/complete.rs        - Completeness assertions
+  machine/deferred.rs        - Deferred proof verifier
+  machine/wrap.rs            - SNARK wrapper verifier
+  machine/vkey_proof.rs      - VK Merkle tree verification
+  machine/public_values.rs   - PV digest computation
+  shard.rs                   - Shard proof verifier
+  challenger.rs              - Fiat-Shamir challenger
+  logup_gkr.rs               - LogUp+GKR permutation argument verifier
+  sumcheck/mod.rs            - Sumcheck protocol verifier
+  basefold/mod.rs            - Basefold PCS verifier (replaces FRI)
+
+slop/crates/                 - "slop" library (Plonky3 fork)
+  basefold/                  - Basefold verifier logic
+  sumcheck/                  - Sumcheck prover/verifier
+  merkle-tree/               - Merkle tree commitment scheme
+  multilinear/               - MLE operations
+  challenger/                - Challenger implementations
+
+crates/prover/src/verify.rs  - Top-level verification logic
+crates/verifier/             - On-chain Groth16/PLONK verification
+
+================================================================================
+4. CODE AUDIT FINDINGS
+================================================================================
+
+FINDING 1: MaybeUninit Usage in Compress Verifier (LOW-MEDIUM)
+--------------------------------------------------------------
+File: crates/recursion/circuit/src/machine/compress.rs:117-154
+
+The compress verifier initializes many variables with:
+  `unsafe { MaybeUninit::zeroed().assume_init() }`
+
+For the `Felt<SP1Field>` type (which wraps a u32 index), zeroed memory
+produces index 0. These variables are later assigned in the i==0 branch of
+the loop. If `vks_and_proofs` is empty, the `assert!(!vks_and_proofs.is_empty())`
+at line 123 catches it. However, if a malicious prover could somehow cause
+the loop to skip the i==0 initialization while still executing subsequent
+iterations, the uninitialized indices would reference arbitrary circuit
+variables.
+
+Current mitigation: The assert at line 123 and the for-loop structure prevent
+this. This is a defensive concern, not an active exploit.
+
+FINDING 2: value_assertions Parameter Controls Digest Checks (MEDIUM)
+---------------------------------------------------------------------
+Files: crates/recursion/circuit/src/machine/vkey_proof.rs:66-79
+
+The SP1MerkleProofVerifier::verify function takes a `value_assertions: bool`
+parameter. When value_assertions=false, line 77 becomes:
+  SC::assert_digest_eq(builder, value, value);
+This is a self-comparison that is always true, effectively SKIPPING the
+check that the Merkle leaf matches the expected VK digest.
+
+This parameter is used by:
+- deferred.rs (line 137): passes value_assertions as a parameter
+- root.rs (line 44): passes it through
+
+CRITICAL QUESTION: Who controls the `value_assertions` parameter? If a
+recursive proof can influence this value to be false, the VK membership
+check is bypassed. This would allow arbitrary VKs to be used without Merkle
+proof validation.
+
+Investigation needed: Trace all call sites to determine if value_assertions
+can ever be false in production. If the recursion programs are pre-compiled
+with value_assertions=true, this is safe. If there's any path where it could
+be false, this is a HIGH severity finding.
+
+FINDING 3: contains_first_shard Accumulation Without Upper Bound (LOW)
+----------------------------------------------------------------------
+File: crates/recursion/circuit/src/machine/compress.rs:204-216
+
+The `contains_first_shard` flag is accumulated via addition across proofs:
+  contains_first_shard = builder.eval(contains_first_shard +
+      current_public_values.contains_first_shard);
+
+Each individual proof's contains_first_shard is checked to be boolean (0 or 1),
+and the accumulated value is also checked to be boolean at line 409-412.
+This means at most ONE proof in the batch can have contains_first_shard=1.
+
+However, the boolean check is: x*(x-1) == 0 in the field. Over SP1Field
+(BabyBear, p=2^31 - 1), if many proofs each contribute contains_first_shard=1,
+the sum wraps around. For the sum to pass the boolean check, we need
+sum = 0 or sum = 1 (mod p). With up to 2^MAX_LOG_NUMBER_OF_SHARDS proofs,
+the range check on num_included_shard bounds the number of proofs.
+
+Potential issue: If MAX_LOG_NUMBER_OF_SHARDS allows enough proofs that
+the sum wraps to 0 or 1 mod p, the first-shard invariant is violated.
+MAX_LOG_NUMBER_OF_SHARDS needs to be checked against p to confirm this is
+safe.
+
+FINDING 4: Fiat-Shamir Challenger Padding Pattern (LOW)
+-------------------------------------------------------
+Files: Multiple locations in the recursive verifier
+
+The challenger initialization always observes:
+  - preprocessed_commit
+  - pc_start
+  - initial_global_cumulative_sum (x and y coordinates)
+  - enable_untrusted_programs
+  - 6 zero padding elements
+
+This pattern is consistent across core.rs, compress.rs, deferred.rs, and
+wrap.rs. The padding with 6 zeros appears to be for alignment. The consistency
+is good - inconsistent padding between prover and verifier would be a
+Fiat-Shamir domain separation issue.
+
+No vulnerability found here, but this is worth monitoring during future
+refactors.
+
+FINDING 5: LogUp GKR Denominator Division (MEDIUM)
+---------------------------------------------------
+File: crates/recursion/circuit/src/logup_gkr.rs:110-118
+
+The cumulative sum is computed as:
+  output_cumulative_sum = sum of (numerator[i] / denominator[i])
+
+If a malicious prover can craft a proof where any denominator[i] equals zero,
+this would cause a division by zero in the field, which is undefined behavior
+in the constraint system. In BabyBear, division by zero may silently produce
+an arbitrary value or be unconstrained.
+
+Investigation needed: Verify that the GKR protocol ensures denominators are
+non-zero via the random challenge mechanism (they should be non-zero with
+overwhelming probability since they involve random alpha and beta challenges).
+But if the denominator MLE is entirely prover-controlled and not properly
+bound to the Fiat-Shamir transcript, this could be exploitable.
+
+FINDING 6: Sumcheck Verification Final Check (LOW)
+---------------------------------------------------
+File: crates/recursion/circuit/src/sumcheck/mod.rs:112-121
+
+The sumcheck verifier checks:
+1. First poly: eval_one + eval_zero == claimed_sum
+2. Each subsequent poly: eval_at_alpha == next_poly.eval_one + next_poly.eval_zero
+3. Final: last_poly.eval_at_alpha == claimed_final_eval
+4. Alpha point matches the proof's point
+
+The final check at line 116-118 verifies that the alpha_point (accumulated
+from sampled challenges) matches the proof's claimed point. This is correct.
+
+The check at line 120 verifies that the last polynomial evaluated at alpha
+matches the claimed evaluation. This follows the standard sumcheck protocol.
+
+No vulnerability found, but noting the structure for completeness.
+
+FINDING 7: Basefold verify_queries Folding Logic (MEDIUM)
+---------------------------------------------------------
+File: crates/recursion/circuit/src/basefold/mod.rs:304-417
+
+The basefold query verification performs FRI-like folding. At each round:
+1. Verifies the Merkle opening against the commitment
+2. Checks the folded evaluation is consistent with the query opening
+3. Folds the evaluation using interpolation at the sampled beta
+
+The folding uses division (DivEF at line 383):
+  temp_3 = (evals[1] - evals[0]) / (xs[1] - xs[0])
+
+If xs[1] == xs[0] (i.e., the two sibling evaluation points are the same),
+this is a division by zero. In normal operation this shouldn't happen because
+xs[0] and xs[1] are multiplicative inverses in a coset. But a malicious
+prover controlling the query opening values could potentially trigger this.
+
+Investigation needed: Verify that the Merkle tree opening proof prevents
+a prover from choosing sibling nodes that would cause xs[1]==xs[0].
+
+FINDING 8: Deferred Verifier Last Init/Finalize Address (LOW-MEDIUM)
+--------------------------------------------------------------------
+File: crates/recursion/circuit/src/machine/deferred.rs:212-220
+
+The deferred verifier sets init/finalize addresses and page indices all to
+zero. When this gets aggregated in compress.rs, the compress verifier checks
+chaining of these addresses. The deferred proof is marked is_complete=false
+(line 251), so the completeness check in assert_complete won't check the
+address invariants.
+
+However, if a deferred proof's public values are incorrectly chained with
+a core proof's addresses, the address continuity could be violated. This
+depends on the ordering logic in the compress stage.
+
+Investigation needed: Verify that the compress stage correctly handles
+interleaving of core and deferred proofs w.r.t. address continuity.
+
+FINDING 9: assert_felt_ne Implementation (LOW)
+-----------------------------------------------
+File: crates/recursion/compiler/src/circuit/compiler.rs:226-237
+
+assert_felt_ne computes: diff = lhs - rhs; out = 1 / diff
+If lhs == rhs, diff = 0 and dividing by zero should cause a constraint
+failure. This is the standard non-equality check in ZK circuits and is
+correct.
+
+However, the implementation of DivF in the underlying executor needs to be
+verified to ensure it properly fails on division by zero rather than
+silently producing an arbitrary value.
+
+FINDING 10: Septic Curve Digest Zero Check (LOW)
+-------------------------------------------------
+File: crates/recursion/circuit/src/machine/complete.rs:147
+
+  builder.assert_digest_zero_v2(is_complete, *global_cumulative_sum);
+
+This checks that the global cumulative sum (a point on the septic curve)
+is the identity/zero point when is_complete=1. The implementation of
+assert_digest_zero_v2 needs to be verified to ensure it correctly handles
+the representation of the zero point on the septic curve.
+
+================================================================================
+5. POTENTIAL ATTACK VECTORS (REQUIRES FURTHER INVESTIGATION)
+================================================================================
+
+VECTOR A: VK Membership Bypass via value_assertions (FINDING 2)
+---------------------------------------------------------------
+Priority: HIGH
+If value_assertions can be set to false in any production code path, a
+malicious prover could use arbitrary verifying keys without proper Merkle
+tree membership proofs. This would allow proving arbitrary programs as if
+they were approved programs.
+
+Action: Trace all callers of SP1MerkleProofVerifier::verify,
+SP1CompressWithVKeyVerifier::verify, and SP1DeferredVerifier::verify to
+confirm value_assertions is always true in production circuit builds.
+
+VECTOR B: Basefold Division by Zero in Query Phase (FINDING 7)
+--------------------------------------------------------------
+Priority: MEDIUM
+A malicious prover crafting specific query openings to trigger division by
+zero in the FRI folding could potentially bypass the consistency check.
+
+Action: Analyze whether the Merkle tree opening proof cryptographically
+prevents this, or if additional constraints are needed.
+
+VECTOR C: LogUp Denominator Zero (FINDING 5)
+---------------------------------------------
+Priority: MEDIUM
+If the LogUp GKR denominator evaluations can be zero, the cumulative sum
+check becomes meaningless.
+
+Action: Verify that the random challenge (alpha, beta) ensures denominators
+are non-zero with overwhelming probability, and that the prover cannot
+influence the denominator values independently of the Fiat-Shamir transcript.
+
+VECTOR D: Plonky3/"slop" Undiscovered Bugs
+-------------------------------------------
+Priority: MEDIUM-HIGH
+SP1 forked Plonky3 as "slop" and made significant changes (basefold,
+jagged PCS, etc.). These new components haven't had the same scrutiny as
+the original Plonky3 code. The slop/crates/ directory contains:
+- basefold/ and basefold-prover/ (new PCS)
+- jagged/ (variable-width polynomial handling)
+- whir/ (new commitment scheme variant)
+- stacked/ (stacked polynomial technique)
+
+These are all novel cryptographic components that could contain soundness bugs.
+
+VECTOR E: Memory Consistency Across Shard Boundaries
+-----------------------------------------------------
+Priority: MEDIUM
+The memory AIR (air/memory.rs) uses send/receive interactions for memory
+reads and writes. The timestamp ordering ensures reads happen after writes
+within a shard. Across shards, the init/finalize address chaining in
+compress.rs and the verify function in prover/src/verify.rs handles
+cross-shard consistency.
+
+Action: Verify that a malicious prover cannot insert phantom memory
+operations between shards by manipulating the address/timestamp boundaries.
+
+VECTOR F: Recursion Public Values Digest Truncation
+----------------------------------------------------
+Priority: LOW-MEDIUM
+The recursion public values digest is computed over NUM_PV_ELMS_TO_HASH
+elements (public_values.rs:40), not all public value elements. If any
+security-critical public value field is excluded from the hash, a malicious
+prover could modify it without invalidating the digest.
+
+Action: Verify that all security-relevant fields are included in
+NUM_PV_ELMS_TO_HASH.
+
+================================================================================
+6. BOUNTY SCOPE & RULES (Code4rena)
+================================================================================
+
+Max bounty: $150,000 USDC
+
+In scope:
+- Soundness bugs in SP1's proof system
+- Issues that allow forging proofs for invalid computations
+- Bugs in the STARK constraints, recursive verification, or SNARK wrapping
+
+Out of scope:
+- Bugs in user programs compiled for SP1
+- Informational findings
+- Documentation errors
+- Issues requiring infeasible computation
+- Previously reported vulnerabilities (V3 bugs, Plonky3 GHSA advisories)
+
+Requirements:
+- Valid proof of concept required
+- Must demonstrate soundness violation (not just theoretical)
+- Do not disclose without consent from Succinct
+
+Previous audits/advisories (ineligible for bounty):
+- V3 chip_ordering bug
+- V3 incomplete proof flag bug
+- Plonky3 Fiat-Shamir observation bug
+- Plonky3 FRI verifier bugs (GHSA-f69f-5fx9-w9r9, GHSA-6248-228x-mmvh)
+
+================================================================================
+7. RECOMMENDATIONS FOR DEEPER INVESTIGATION
+================================================================================
+
+PRIORITY 1 - Highest Likelihood of Bounty:
+-------------------------------------------
+a) Trace `value_assertions` parameter through all production code paths
+   to determine if VK membership checks can be bypassed. If exploitable,
+   this is likely a HIGH/CRITICAL finding.
+
+b) Audit the slop/crates/basefold/ and slop/crates/jagged/ implementations.
+   These are relatively new and replace the battle-tested Plonky3 FRI code.
+   Focus on:
+   - Degree bound enforcement
+   - Query index sampling and domain separation
+   - Tensor commitment scheme opening verification
+
+c) Audit the LogUp+GKR verifier end-to-end. The interaction between the
+   GKR circuit layers, sumcheck verification, and final trace opening
+   consistency check is complex and has many moving parts.
+
+PRIORITY 2 - Medium Likelihood:
+-------------------------------
+d) Fuzz the divrem ALU chip with edge cases: division by zero, signed
+   overflow (i64::MIN / -1), and boundary values at field modulus.
+
+e) Verify the assert_digest_zero_v2 implementation for the septic curve.
+   A wrong zero-point representation could allow non-zero cumulative sums.
+
+f) Check that the stacked PCS (slop/crates/stacked/) correctly handles
+   the relationship between stacking height and column counts.
+
+PRIORITY 3 - Lower Likelihood but High Impact:
+-----------------------------------------------
+g) Analyze the SNARK wrapping (Groth16/PLONK) for transcript mismatches
+   between the inner recursive proof and the outer SNARK verifier.
+
+h) Review the Poseidon2 permutation implementation in slop for correctness
+   against the reference specification.
+
+i) Check for timing/side-channel leaks in the prover that could allow
+   extraction of witness data (less relevant for bug bounty but worth noting).
+
+================================================================================
+END OF REPORT
+================================================================================

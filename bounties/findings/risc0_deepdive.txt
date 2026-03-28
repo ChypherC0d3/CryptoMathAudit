@@ -1,0 +1,410 @@
+================================================================================
+RISC ZERO DEEP DIVE SECURITY AUDIT - STARK/FRI + GROTH16 ON-CHAIN VERIFIERS
+================================================================================
+Date: 2026-03-28
+Repo: https://github.com/risc0/risc0 (HEAD: fee66d0)
+Bounty: HackenProof - up to $150K critical
+Scope: risc0-zkvm (STARK verifier), Blockchain Verifiers (Groth16 on-chain)
+Out of scope: risc0/circuit/rv32im-m3-sys (pre-production)
+
+================================================================================
+1. EXECUTIVE SUMMARY
+================================================================================
+
+RISC Zero uses a custom STARK proof system with DEEP-ALI + FRI over the BabyBear
+field (p = 15*2^27 + 1 = 2013265921), with extension degree 4. Proofs are then
+wrapped via Groth16 over BN254 for on-chain verification. The codebase has been
+through extensive auditing (Veridise 96 person-weeks) and has had multiple
+critical CVEs in 2025 (CVE-2025-52484, CVE-2025-61588).
+
+Key parameters:
+  - Field: BabyBear (p = 2013265921)
+  - Extension degree: 4 (ExtElem has ~120 bits)
+  - QUERIES: 50
+  - INV_RATE: 4 (rate = 1/4)
+  - FRI_FOLD: 16 (folding factor)
+  - FRI_MIN_DEGREE: 256
+  - Conjectured security: ~97 bits (Toy Problem Conjecture)
+
+NOTE: RISC Zero does NOT use Plonky3. They have their own custom STARK
+implementation. Therefore, the Plonky3 FRI bugs that affected SP1 do NOT
+directly apply here.
+
+================================================================================
+2. KNOWN VULNERABILITIES (Already Patched)
+================================================================================
+
+CVE-2025-52484 (CRITICAL) - Underconstrained rv32im Circuit
+  - Missing constraint allowed rs1/rs2 register confusion in 3-register
+    RISC-V instructions (remu, divu, etc.)
+  - Malicious prover could forge proofs with incorrect execution results
+  - Affected: risc0-zkvm 2.0.0-2.0.2, fixed in 2.1.0
+  - Found by: Christoph "zkCrusher" Hochrainer via HackenProof
+
+Signed Integer Division Bug (2025)
+  - Separate underconstrained division vulnerability
+  - Fixed in risc0-zkvm 2.2.0 (disclosed Aug 5, 2025)
+
+CVE-2025-61588 (CRITICAL) - sys_read Arbitrary Code Execution
+  - Host could craft sys_read response to write arbitrary memory in guest
+  - Root cause: trusted host-reported byte count for pointer arithmetic
+  - Fixed in risc0-zkvm 2.3.2 and 3.0.3
+
+================================================================================
+3. FRI PROTOCOL ANALYSIS
+================================================================================
+
+File: risc0/zkp/src/verify/fri.rs
+File: risc0/zkp/src/prove/fri.rs
+
+3.1 FRI Folding Verification (verify_query)
+  - Verifier checks data_ext[quot] == *goal (line 87-89)
+  - Computes inverse root: inv_wk = ROU_REV[root_po2].pow(group) (line 92)
+  - Applies interpolate_ntt + bit_reverse before polynomial evaluation
+  - New goal = poly_eval(data_ext, mix * inv_wk) (line 96)
+
+  FINDING: The folding uses a SINGLE random mix per round, drawn AFTER the
+  Merkle commitment (line 57 in VerifyRoundInfo::new). This is correct -
+  the challenge is sampled after the commitment, matching Fiat-Shamir.
+
+  OBSERVATION: Unlike Plonky3's bug where lower-degree polynomials were
+  rolled in without randomness, RISC Zero's FRI does batching at a higher
+  level (in verify_validity) using a separate mix value, and the FRI itself
+  only handles a single polynomial per round. This design avoids the class
+  of bug that hit Plonky3/SP1.
+
+3.2 Final Polynomial Degree Check
+  - fri_verify reads final_coeffs of size (EXT_SIZE * degree) at line 133
+  - Then evaluates and checks fx == goal at line 159
+  - The degree variable tracks reduction: starts at tot_cycles, divided by
+    FRI_FOLD each round until <= FRI_MIN_DEGREE (256)
+
+  FINDING: The final polynomial degree IS checked implicitly - the verifier
+  reads exactly (degree * EXT_SIZE) coefficients and evaluates a polynomial
+  of that degree. A prover sending more coefficients would cause the IOP to
+  have leftover data, caught by verify_complete() at the end. This is
+  different from Plonky3's missing degree check.
+
+3.3 Query Position Sampling
+  - Positions sampled via iop.random_bits(log2_ceil(orig_domain))
+  - orig_domain = INV_RATE * tot_cycles
+  - POTENTIAL CONCERN: random_bits returns a u32 with `bits` random bits.
+    If orig_domain is not a power of 2, positions above orig_domain could
+    theoretically be sampled. However, since INV_RATE=4 and tot_cycles is
+    always a power of 2, orig_domain IS always a power of 2, so this is safe.
+
+================================================================================
+4. DEEP-ALI COMPOSITION ANALYSIS
+================================================================================
+
+File: risc0/zkp/src/verify/mod.rs (fri_eval_taps and verify_validity)
+
+4.1 Constraint Polynomial Mixing
+  - poly_mix sampled at line 312 AFTER all merkle commitments
+  - Used inside validity_fn to mix all constraint polynomials
+  - check polynomial built from coeff_u with specific remap [0,2,1,3] at line 384
+
+  FINDING: The remap array [0, 2, 1, 3] is hardcoded and only valid for
+  extension degree 4. Comment on line 378 acknowledges this limitation.
+  If extension degree ever changes, this would break silently.
+
+4.2 DEEP Query Point
+  - z = iop.random_ext_elem() at line 333 (non-debug mode)
+  - Used consistently in all evaluations
+  - back_one = ROU_REV[po2] correctly uses the reverse root for the trace domain
+
+4.3 Combo U Coefficients and FRI Batching
+  - U coefficients read from IOP and committed via hash (lines 343-347)
+  - FRI batching mix sampled at line 409 AFTER check merkle commitment
+  - combo_u mixed with powers of mix (lines 420-431)
+  - check group also mixed (lines 439-445)
+
+  FINDING: Fiat-Shamir transcript ordering appears correct:
+    1. Circuit info committed
+    2. Globals + po2 committed
+    3. Code merkle committed
+    4. Data merkle committed
+    5. Accum mix drawn, accum merkle committed
+    6. poly_mix drawn
+    7. Check merkle committed
+    8. z drawn (DEEP query point)
+    9. U coefficients committed
+    10. FRI mix drawn
+    11. FRI rounds (commit then draw)
+    12. Final coefficients committed
+    13. Query positions drawn
+
+4.4 Division by Zero Risk in fri_eval_taps
+  - Line 283: divisor.inv() used after accumulating product of (x - z*back_one^k)
+  - If x equals any z*back_one^k, divisor would be zero
+  - BabyBear inv(0) returns 0 (by convention per line 105 of baby_bear.rs)
+  - This means a zero divisor would silently zero out the contribution
+    rather than erroring
+
+  AREA OF INTEREST (LOW-MEDIUM): The Elem::inv() implementation returns 0
+  for inv(0), which is documented as intentional for convenience. However,
+  in fri_eval_taps, if a DEEP query point z happens to coincide with an
+  evaluation point, the contribution of that combo to the FRI polynomial
+  would vanish. This is astronomically unlikely for random z over the
+  extension field (~2^-120 per combo), but the silent failure mode is
+  worth noting. A more defensive implementation would return an error.
+
+================================================================================
+5. GROTH16 VERIFIER ANALYSIS
+================================================================================
+
+5.1 Rust Verifier (risc0/groth16/src/verifier.rs)
+  - Uses ark-groth16 library (well-audited)
+  - Points deserialized via ark's CanonicalDeserialize which validates
+    curve membership
+  - Public inputs split from digest with split_digest() which reverses
+    bytes and converts to Fr
+
+  FINDING: The Rust verifier delegates to ark-groth16 which handles all
+  pairing checks, subgroup checks, etc. No novel attack surface here.
+
+5.2 Solidity Verifier (groth16_proof/groth16/verifier.sol)
+  - Generated by snarkJS (standard template)
+  - Uses EVM precompiles: 6 (ecAdd), 7 (ecMul), 8 (ecPairing)
+
+  Analysis of input validation:
+  - Public signals: checkField validates < r (scalar field order) - CORRECT
+  - Proof points (A, B, C): NO explicit validation that they are on the curve
+
+  IMPORTANT OBSERVATION: The EVM precompiles (6, 7, 8) introduced by
+  EIP-196/197 validate that points are on the curve. ecMul (precompile 7)
+  returns (0,0) on failure, and ecPairing (precompile 8) also validates
+  inputs. So the Solidity verifier relies on precompile-level validation,
+  which is standard practice and considered safe.
+
+  POTENTIAL ISSUE - No explicit subgroup check on G1/G2 proof points:
+  For BN254, G1 has cofactor 1 (so all curve points are in the subgroup).
+  For G2, the cofactor is non-trivial, BUT the pairing precompile (8)
+  does check G2 subgroup membership (per EIP-197). So this is safe.
+
+  FINDING: The g1_mulAccC function computes IC[i]*pubSignal[i] + accumulator
+  using ecMul then ecAdd. The computation uses mload(0x40) as scratch space
+  and properly restores the free memory pointer. No reentrancy or memory
+  corruption issues visible.
+
+  GAS CONCERN: The staticcall uses sub(gas(), 2000) which leaves 2000 gas
+  as a buffer. This is standard snarkJS practice. An attacker cannot
+  manipulate gas to cause partial execution since staticcall returns 0 on
+  failure, and all failures return false.
+
+================================================================================
+6. FIELD ARITHMETIC ANALYSIS (BabyBear)
+================================================================================
+
+File: risc0/core/src/field/baby_bear.rs
+
+6.1 Montgomery Form
+  - Uses Montgomery representation with M = 0x88000001
+  - R2 = 1172168163
+  - Standard encode/decode via Montgomery multiplication
+
+6.2 Random Element Generation
+  - Uses 192-bit sampling mod P (6 rounds of 32-bit values)
+  - Bias is < 2^-161 per sample, well below security target
+  - Comment explains this is O(1) for compatibility with verifier circuit
+
+6.3 Roots of Unity
+  - MAX_ROU_PO2 = 27 (matches P-1 = 15*2^27)
+  - ROU_FWD and ROU_REV tables provided as constants
+  - These should be verified: ROU_FWD[27] = 137, ROU_REV[27] = 749463956
+
+  VERIFICATION NEEDED: The roots of unity table values should be verified
+  independently. An incorrect root would silently break NTT correctness and
+  could lead to soundness issues. However, this has likely been thoroughly
+  tested and audited.
+
+6.4 Inverse of Zero
+  - inv(0) = 0^(P-2) = 0 (documented at line 105)
+  - This is used in fri_eval_taps division (see section 4.4)
+
+================================================================================
+7. CIRCUIT CONSTRAINTS ANALYSIS
+================================================================================
+
+7.1 rv32im Circuit (V3 architecture)
+  File: risc0/circuit/rv32im/src/verify.rs
+  File: risc0/circuit/rv32im/src/zirgen/poly_ext.rs (28,009 lines, auto-generated)
+
+  - Circuit generated by Zirgen compiler
+  - V3 protocol uses CircuitCoreDefV3 trait with GroupInfo
+  - Two groups: Group 0 (54 globals, 0 mix), Group 1 (0 globals, 200 mix values)
+
+  HISTORICAL PATTERN: Both CVE-2025-52484 (register confusion) and the signed
+  division bug were underconstrained circuit issues found in the Zirgen-generated
+  code. The auto-generated poly_ext.rs is 28K lines and extremely hard to audit
+  manually. Veridise used their Picus tool for formal verification.
+
+  The latest HEAD commit (fee66d0) adds "missing m3 constraints around alignment"
+  which suggests constraint completeness issues continue to be found, albeit in
+  the pre-production m3 circuit (currently out of scope).
+
+7.2 Recursion Circuit
+  File: risc0/circuit/recursion/
+  - Separate circuit for proof composition
+  - Uses same STARK infrastructure
+
+  AREA OF INTEREST: Recursion circuits are particularly sensitive to
+  underconstrained bugs since a soundness issue here could allow forging
+  proofs for any statement.
+
+================================================================================
+8. SP1/PLONKY3 COMPARISON
+================================================================================
+
+8.1 Architecture Differences
+  - RISC Zero: Custom STARK with DEEP-ALI + FRI, own field implementation
+  - SP1: Uses Plonky3 as proof system library
+
+  RISC Zero does NOT share code with Plonky3. The vulnerability patterns differ:
+
+  Plonky3 Bug 1 (Missing randomness for lower-degree polys):
+    RISC Zero handles batching differently - uses combo_u with explicit
+    random linear combination (mix). Not vulnerable to this pattern.
+
+  Plonky3 Bug 2 (Missing final polynomial degree check):
+    RISC Zero checks degree implicitly by reading exactly the right number
+    of coefficients and verifying IOP completeness. Not vulnerable.
+
+  Plonky3/SP1 Fiat-Shamir Issue (evaluation claims not observed before sampling):
+    RISC Zero commits U coefficients hash BEFORE sampling the FRI mix
+    (lines 346-347 vs 409). Appears correctly ordered.
+
+8.2 Shared Vulnerability Patterns
+  Despite different codebases, both systems share these risk areas:
+  - Underconstrained circuits (RISC Zero's #1 vulnerability class historically)
+  - Fiat-Shamir completeness
+  - Extension field arithmetic correctness
+
+================================================================================
+9. POTENTIAL AREAS FOR FURTHER INVESTIGATION
+================================================================================
+
+PRIORITY HIGH:
+
+  H1. Circuit Constraint Completeness (BEST BET for bounty)
+    - The 28K-line poly_ext.rs is auto-generated and historically buggy
+    - Pattern: 3-register instructions where operands can be confused
+    - Look at: multiply, shift, branch instructions
+    - Tool: Write a custom constraint checker or use Picus-like approach
+    - Historical hit rate: 2 critical CVEs in 2025 from this class
+
+  H2. Recursion Circuit Constraints
+    - risc0/circuit/recursion/ - same class of bugs as rv32im
+    - Less scrutinized than the main execution circuit
+    - A soundness bug here is maximally impactful
+
+  H3. Memory Consistency Permutation Argument
+    - Uses PLONK-style permutation for memory access ordering
+    - Uses PLOOKUP for byte lookup tables
+    - Grand product accumulator degree bounds are critical
+    - Error bound: w_accum/ext_size * (max_degree-2) * trace_domain_size / ext_field_size
+
+PRIORITY MEDIUM:
+
+  M1. sys_read Return Value Validation
+    - Current code in syscall.rs line 623: returns nbytes_read directly
+      from host without clamping to requested nbytes
+    - Caller (FdReader::read_bytes_all) would panic on split_at_mut if
+      nbytes_read > buf.len(), but this relies on Rust bounds checking
+    - The underlying write already happened before the return value is checked
+    - Status: May already be fixed via circuit constraints that validate
+      memory writes, but worth verifying end-to-end
+
+  M2. Fiat-Shamir Transcript in V3 Protocol
+    - verify_v3 sets po2 and tot_cycles directly from seal input (lines 600-601)
+    - These are NOT committed to the transcript before being used
+    - po2 is validated against MAX_CYCLES_PO2 but not committed
+    - In the old verify(), po2 is read via read_slice_with_po2 which
+      commits the hash. In verify_v3, po2 comes from the seal prefix
+      and is set directly without Fiat-Shamir commitment
+
+    FINDING (MEDIUM): In verify_v3 (rv32im V3 circuit), po2 is extracted
+    from the seal at lines 70-76 of rv32im/verify.rs and passed to
+    verify_v3, where it's set directly at lines 600-601 WITHOUT being
+    hashed into the Fiat-Shamir transcript. This differs from the older
+    verify() function where po2 is included in the committed globals.
+
+    Impact assessment: po2 determines tot_cycles which sizes all domain
+    computations. If a prover can manipulate po2 independently of the
+    transcript, they could potentially create domain size mismatches.
+    However, the Merkle trees commit to specific domain sizes, so a
+    mismatch would likely cause verification failure. Still, the asymmetry
+    between verify() and verify_v3() in transcript handling is suspicious
+    and warrants closer examination.
+
+  M3. Groth16 Verifying Key Integrity
+    - VK constants hardcoded in both Rust and Solidity
+    - If VK constants between Rust verifier and Solidity verifier don't
+      match, a proof valid on-chain might not verify off-chain (or vice versa)
+    - Need to verify: IC0-IC5, alpha, beta, gamma, delta match between files
+    - Quick check: IC0_X in Rust == IC0x in Solidity (both are
+      8446592859352799428420270221449902464741693648963397251242447530457567083492)
+      MATCH confirmed for IC0.
+
+PRIORITY LOW:
+
+  L1. NTT Roots of Unity Verification
+    - Verify ROU_FWD[27] = 137 is indeed a primitive 2^27-th root of unity mod P
+    - Verify all ROU_FWD[i]^(2^i) == 1 mod P
+    - Verify ROU_FWD[i] * ROU_REV[i] == 1 mod P for all i
+
+  L2. MerkleTreeParams Edge Cases
+    - top_layer computation uses simple loop (lines 50-56 of merkle.rs)
+    - Could theoretically overflow for very large row_size values
+    - Not exploitable in practice since row_size is bounded by MAX_CYCLES_PO2=24
+
+  L3. unsafe Code in Merkle Verifier
+    - merkle.rs lines 117-126 use unsafe assume_init_ref and set_len
+    - Correctness depends on the fill order being exactly right
+    - Review confirms it fills top-down which is correct, but unsafe code
+      is always worth extra scrutiny
+
+================================================================================
+10. RECOMMENDATIONS FOR BOUNTY HUNTING
+================================================================================
+
+1. HIGHEST ROI: Focus on circuit constraint completeness in rv32im poly_ext.rs.
+   This is where 2 of 3 critical CVEs came from. The auto-generated constraints
+   are 28K lines and hard to audit manually. Consider:
+   - Building a differential fuzzer that compares circuit execution against
+     a reference RISC-V emulator
+   - Focusing on complex instructions: division, remainder, shifts, branches
+   - Looking for register aliasing or operand confusion patterns
+
+2. SECOND PRIORITY: Investigate the verify_v3 Fiat-Shamir handling of po2.
+   The fact that po2 is not committed in the same way as in the older verify()
+   could indicate a subtle soundness gap. Build a test that tries different
+   po2 values with the same proof body.
+
+3. THIRD PRIORITY: Recursion circuit constraints - same class of bugs as
+   rv32im but potentially less audited.
+
+4. The Groth16 on-chain verifier (Solidity) is standard snarkJS-generated
+   code with no obvious issues. Unless there's a novel attack on the
+   public input encoding (split_digest), this is unlikely to yield findings.
+
+5. The FRI protocol implementation appears solid and avoids the pitfalls
+   that affected Plonky3/SP1. The custom implementation has its own
+   design patterns that differ significantly from Plonky3.
+
+================================================================================
+11. SOURCES
+================================================================================
+
+- HackenProof RISC Zero Bug Bounty: https://hackenproof.com/programs/risc-zero-blockchain-verifiers
+- CVE-2025-52484 Advisory: https://github.com/risc0/risc0/security/advisories/GHSA-g3qg-6746-3mg9
+- CVE-2025-61588 (sys_read RCE): https://www.miggo.io/vulnerability-database/cve/CVE-2025-61588
+- Circuit Breaker writeup: https://hackenproof.com/blog/for-hackers/risc-zero-zkvm-missing-constraint-vulnerability
+- Veridise Audit Report: https://veridise.com/wp-content/uploads/2025/04/VAR-Risc0-241028-Round2-V4.pdf
+- Plonky3 FRI Bug (GHSA-f69f-5fx9-w9r9): https://github.com/Plonky3/Plonky3/security/advisories/GHSA-f69f-5fx9-w9r9
+- SP1 Security Advisory: https://x.com/SuccinctLabs/status/1929773028034204121
+- RISC Zero Formal Verification: https://risczero.com/blog/RISCZero-formally-verified-zkvm
+
+================================================================================
+END OF REPORT
+================================================================================

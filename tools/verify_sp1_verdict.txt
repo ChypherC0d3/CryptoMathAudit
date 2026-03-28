@@ -1,0 +1,133 @@
+SP1 VKEY_PROOF.RS VALUE_ASSERTIONS VULNERABILITY VERIFICATION
+=============================================================
+Date: 2026-03-28
+Auditor: Independent verification from scratch
+
+REPOSITORY: https://github.com/succinctlabs/sp1 (latest commit)
+FILE: crates/recursion/circuit/src/machine/vkey_proof.rs
+
+========================================================================
+ANALYSIS
+========================================================================
+
+1. DOES THE CODE EXIST?
+   YES. In SP1MerkleProofVerifier::verify() at line 62-79 of vkey_proof.rs:
+
+     pub fn verify(
+         builder: &mut Builder<C>,
+         digests: Vec<SC::DigestVariable>,
+         input: SP1MerkleProofWitnessVariable<C, SC>,
+         value_assertions: bool,
+     ) {
+         ...
+         for ((proof, value), expected_value) in ... {
+             verify::<C, SC>(builder, proof.path, proof.index, value, root);
+             if value_assertions {
+                 SC::assert_digest_eq(builder, expected_value, value);
+             } else {
+                 SC::assert_digest_eq(builder, value, value);  // <-- self-comparison
+             }
+         }
+     }
+
+2. DOES value_assertions=false BYPASS THE CHECK?
+   YES, technically. When value_assertions=false, the code asserts
+   `value == value` (trivial self-comparison) instead of
+   `expected_value == value` (the actual VK digest binding).
+
+   HOWEVER, this is INTENTIONAL. The Merkle path verification on line 72
+   still runs regardless:
+     verify::<C, SC>(builder, proof.path, proof.index, value, root);
+
+   The self-comparison serves as a circuit constraint placeholder -- it
+   ensures the circuit shape/constraint count remains consistent whether
+   or not value assertions are enabled. This is a common pattern in
+   recursive STARK circuit design where circuit shapes must be fixed
+   at compile time.
+
+3. IS THERE ANY PRODUCTION CODE PATH THAT PASSES FALSE?
+   NO. This is the critical question that demolishes the claim.
+
+   - The default for vk_verification is TRUE (recursion.rs line 104)
+   - The without_vk_verification() method is gated behind
+     #[cfg(feature = "experimental")] (recursion.rs lines 109-113)
+   - The ONLY callers that pass false are:
+     a) test_e2e_node_experimental -- a #[tokio::test] function
+        (full/mod.rs line 380)
+     b) sp1-gpu perf binary with #[cfg(feature = "experimental")]
+        (node.rs line 79)
+   - The verify.rs file explicitly comments (lines 520-521):
+     "If `vk_verification` is on, check the `vk` is within the
+      expected list of `vk`'s. This `vk_verification` must be only
+      turned off for testing purposes."
+   - The existing audit by rkm0959 already reviewed this code and
+     documented the design rationale (audits/rkm0959.md lines 220-237)
+
+4. IS THE V3 CHIP_ORDERING COMPARISON VALID?
+   NO. The V3 bug was fundamentally different:
+   - chip_ordering: Missing validation in PRODUCTION code paths,
+     allowing attacker-controlled HashMap to corrupt verifier state.
+     Combined with a missing is_complete check, it enabled full
+     proof forgery of arbitrary programs.
+   - value_assertions: An INTENTIONAL, feature-gated, test-only
+     parameter that never reaches production. The Merkle path
+     verification still executes. The circuit shape constraint
+     (self-comparison) is a deliberate design choice.
+
+   The V3 bugs were missing constraints in the production verification
+   pipeline. This is an intentional configuration knob for development.
+   The comparison is misleading and superficial.
+
+5. IS VKEY_PROOF.RS IN CODE4RENA SCOPE?
+   Technically yes -- the Code4rena Succinct bounty covers soundness
+   bugs in SP1's production distribution. However, the bounty requires:
+   - "All reports must be valid on SP1's latest release commit"
+   - A valid proof of concept
+   - The bug must be in the production distribution
+
+   Since value_assertions=false is only reachable through
+   #[cfg(feature = "experimental")] which is not part of the production
+   distribution, this would likely be ruled out of scope or classified
+   as informational at best.
+
+========================================================================
+VERDICT: DISPUTED
+========================================================================
+
+Evidence:
+1. Code exists: YES
+2. value_assertions=false bypasses digest binding: YES (technically)
+3. Production code calls with false: NO
+   - Default is true
+   - without_vk_verification() requires experimental feature flag
+   - Only called in tests and perf benchmarks
+   - Comments explicitly state "only turned off for testing"
+4. In scope for Code4rena bounty: NO (not in production distribution)
+5. Severity: INFORMATIONAL at best (no production impact)
+
+The claim is technically accurate about what the code DOES but
+fundamentally wrong about its IMPACT:
+- The parameter exists and does create a trivial self-comparison
+- But it is NEVER set to false in any production code path
+- It is gated behind an experimental feature flag
+- The existing audit already reviewed and documented this design
+- The Merkle path verification still runs regardless
+- The comparison to V3's chip_ordering bug is misleading and wrong
+
+This is a classic case of confusing a development/testing configuration
+knob with a security vulnerability. It is analogous to complaining that
+a test fixture disables authentication -- that's the point.
+
+Recommendation: DO NOT SUBMIT
+Reason: This would be rejected as informational/out-of-scope and could
+damage credibility with the Code4rena judging panel. The finding
+demonstrates code reading ability but lacks the critical step of
+verifying whether the "vulnerability" is reachable in production.
+
+A legitimate finding here would need to demonstrate either:
+(a) A way to force vk_verification=false in a production build, or
+(b) That the experimental feature flag is inadvertently enabled in
+    published crates/binaries
+
+Neither of these appears to be the case.
+========================================================================

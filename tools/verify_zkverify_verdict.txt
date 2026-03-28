@@ -1,0 +1,216 @@
+================================================================================
+INDEPENDENT SECURITY AUDIT VERDICT
+================================================================================
+Program:    zkVerify Bug Bounty on Immunefi
+Repository: https://github.com/zkVerify/zkVerify
+Date:       2026-03-28
+
+================================================================================
+VERDICT: DISPUTED (Severity downgraded from CRITICAL/HIGH to LOW/INFORMATIONAL)
+================================================================================
+
+Evidence:
+1. Code location:       VERIFIED
+2. Panic exists:        YES
+3. User can trigger:    YES (but impact is severely limited)
+4. Substrate catches:   YES (WASM trap is caught, node does NOT crash)
+5. In scope:            YES
+6. Severity:            LOW (code quality issue, not a node crash DoS)
+
+Recommendation: DO NOT SUBMIT as Critical/High. Could submit as Low/Informational
+                but payout would be minimal or zero.
+
+================================================================================
+DETAILED ANALYSIS
+================================================================================
+
+1. THE PANIC EXISTS AND IS CONFIRMED
+-------------------------------------
+File: verifiers/fflonk/src/vk.rs, line 56
+
+    impl From<Fr> for substrate_bn::Fr {
+        fn from(value: Fr) -> Self {
+            substrate_bn::Fr::from_slice(&value.0.into_bytes())
+                .expect("BUG: should be hardcoded. qed")
+        }
+    }
+
+substrate_bn::Fr::from_slice() returns Result<Fr, FieldError> where FieldError::NotMember
+is returned for values >= BN254 scalar field modulus. The .expect() converts this to a
+panic.
+
+CONTRAST with the Fq conversion (line 60-68) which correctly uses TryInto with proper
+error handling.
+
+2. THE Fr FIELDS ARE USER-CONTROLLED
+--------------------------------------
+The Vk struct (vk.rs lines 30-42) contains 7 Fr fields:
+    k1, k2, w, w3, w4, w8, wr
+
+These are part of the Fflonk verification key that users submit via:
+  - register_vk extrinsic (pallets/verifiers/src/lib.rs line 401)
+  - submit_proof extrinsic with VkOrHash::Vk variant (line 353)
+
+3. TRIGGER PATH CONFIRMED
+---------------------------
+register_vk:
+  Line 408: vk_hash(&vk)       <- Safe (SCALE encode + keccak, no Fr conversion)
+  Line 413: validate_vk(&vk)   <- PANICS HERE
+    -> Fflonk::validate_vk (verifiers/fflonk/src/lib.rs line 78-85)
+    -> vk.clone().try_into() (vk.rs line 137-153)
+    -> self.k1.into() (calls From<Fr> for substrate_bn::Fr)
+    -> .expect() PANICS on out-of-range value
+
+submit_proof with VkOrHash::Vk:
+  Line 373: validate_vk(vk)    <- Same panic path
+
+verify_proof:
+  Line 55-59: try_into_fflonk_vk_unchecked() (vk.rs line 157-172)
+  -> Also calls .into() on all Fr fields <- Same panic path
+
+4. CRITICAL FINDING: SUBSTRATE CATCHES THE PANIC (WASM EXECUTION)
+===================================================================
+
+zkVerify uses WASM-ONLY execution (NOT native runtime):
+
+    relay-node/service/src/lib.rs line 408-414:
+        let executor = WasmExecutor::builder()
+            .with_execution_method(config.executor.wasm_method)
+            ...
+            .build();
+
+There is NO NativeExecutor, NO NativeElseWasm. This is confirmed by:
+- Only WasmExecutor is used in service/src/lib.rs
+- The codebase uses polkadot-sdk stable2412 which defaults to WASM-only
+
+In WASM-only execution:
+- Rust code is compiled to WASM with panic=abort
+- A panic becomes a WASM "unreachable" trap instruction
+- The WASM executor (wasmtime) catches the trap
+- The trap is returned as an error to the caller
+
+5. WHAT ACTUALLY HAPPENS (ATTACK SCENARIO)
+============================================
+
+Scenario A: User submits register_vk with out-of-range Fr value
+  1. Transaction enters mempool (validate_transaction checks only signature/nonce/fees,
+     does NOT execute the dispatchable)
+  2. Block author picks transaction for block inclusion
+  3. Block builder calls apply_extrinsic -> register_vk -> validate_vk -> PANIC
+  4. WASM trap occurs
+  5. Block builder CATCHES the trap (client/block-builder/src/lib.rs, push() method)
+  6. State changes are ROLLED BACK
+  7. Transaction is SKIPPED (not included in block)
+  8. Block is produced WITHOUT this transaction
+  9. Other validators never see this in a block
+  RESULT: Transaction silently dropped. No node crash. No consensus issue.
+
+Scenario B: Malicious validator crafts block including the bad transaction
+  1. Malicious validator bypasses block builder, manually includes the transaction
+  2. Other validators try to import the block
+  3. execute_block -> apply_extrinsic -> PANIC -> WASM trap
+  4. Block import FAILS with error
+  5. Node rejects the invalid block
+  6. Node continues operating normally on the canonical chain
+  7. Malicious validator's block is orphaned
+  RESULT: Block rejected. No node crash. Malicious validator wastes their slot.
+
+6. WHY THIS IS NOT CRITICAL/HIGH
+==================================
+
+The claimed impact was "consensus-halting DoS" via node crashes. This is INCORRECT because:
+
+a) WASM-only execution means panics become traps, which are safely caught
+b) The block builder catches traps from apply_extrinsic and skips bad transactions
+c) Block import failures from invalid blocks do NOT crash the node
+d) There is no scenario where "all validators crash on the same transaction"
+e) The node continues operating normally after encountering this panic
+
+The worst-case impact is:
+- A transaction sits in the mempool until a block author tries to include it, fails,
+  and the transaction is dropped
+- A slight waste of block author resources attempting to include the transaction
+- If a malicious validator forces it into a block, other validators waste time
+  rejecting that block (equivalent to any invalid block)
+
+7. IT IS STILL A BUG (LOW SEVERITY)
+=====================================
+
+The .expect() is incorrect and should be .map_err() like the Fq conversion:
+
+    impl TryInto<substrate_bn::Fr> for Fr {
+        type Error = ConvertError;
+        fn try_into(self) -> Result<substrate_bn::Fr, Self::Error> {
+            substrate_bn::Fr::from_slice(&self.0.into_bytes())
+                .map_err(|_| ConvertError::NotAMemberFr)
+        }
+    }
+
+The comment "BUG: should be hardcoded. qed" suggests the developer assumed these
+values would never come from user input. This assumption is wrong -- users CAN submit
+arbitrary Vk values. However, the Substrate WASM sandbox prevents this from being
+exploitable.
+
+Notably, validate_vk() would need to be updated to use TryInto instead of From,
+and the TryInto<fflonk_verifier::VerificationKey> impl (line 137-153) already
+calls .into() on Fr fields, so it would also need updating.
+
+The same issue exists in try_into_fflonk_vk_unchecked() (line 157-172).
+
+8. IMMUNEFI SCOPE
+===================
+
+The repository https://github.com/zkVerify/zkVerify IS in scope.
+The Immunefi page states "Everything is in scope except Hyperbridge."
+The verifiers/ directory is part of the core Blockchain/DLT asset.
+
+However, the severity does not match Critical ($15k-$50k) or High ($5k-$10k)
+impact categories:
+- Critical requires: "Network not being able to confirm new transactions" or
+  "Direct loss of funds" -- THIS DOES NOT APPLY
+- High requires: "Temporary freezing of network transactions" -- THIS DOES NOT APPLY
+
+At best this is a Low/Informational finding:
+- Improper error handling that COULD be problematic if execution model changes
+- Code quality issue (inconsistency between Fr and Fq conversions)
+- Defense-in-depth concern
+
+9. ADDITIONAL CONSIDERATIONS
+==============================
+
+a) Native runtime was removed from modern Substrate/polkadot-sdk. Even if it existed,
+   Substrate wraps native runtime calls in catch_unwind, so the panic would still be
+   caught (unless double-panic occurs during unwinding).
+
+b) The WASM runtime correctly isolates panics. The wasm32-unknown-unknown target
+   uses panic=abort which becomes a trap, safely caught by wasmtime.
+
+c) The block builder's push() method explicitly handles WASM trap errors by rolling
+   back state and returning an error, not by crashing.
+
+d) No existing test covers out-of-range Fr values (verifier_should.rs only tests
+   invalid G1 points via mut_c0_x, not Fr overflow). This is a test gap.
+
+================================================================================
+FINAL VERDICT
+================================================================================
+
+VERDICT: DISPUTED
+
+The panic at vk.rs:56 is a real code defect, but the claimed impact
+("consensus-halting DoS via node crash") is INCORRECT. Substrate's WASM execution
+sandbox catches the panic/trap safely. The node does not crash. Transactions with
+out-of-range Fr values are silently dropped by the block builder.
+
+Severity: LOW / INFORMATIONAL (not Critical or High)
+
+Recommendation: DO NOT SUBMIT as Critical/High to Immunefi. The report would
+likely be downgraded or closed as informational. If submitted as Low, the payout
+would be minimal ($0-$1,000 range, if any). The bug is real but the impact claim
+is fundamentally wrong due to misunderstanding Substrate's WASM execution model.
+
+The fix is straightforward: change From<Fr> to TryInto<Fr> with proper error
+handling, matching the existing pattern used for Fq. This would be a good PR
+to submit directly to the repository.
+
+================================================================================

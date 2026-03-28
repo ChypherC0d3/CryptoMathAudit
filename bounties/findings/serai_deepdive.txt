@@ -1,0 +1,617 @@
+================================================================================
+SERAI DEX - DEEP DIVE CRYPTOGRAPHIC SECURITY AUDIT
+================================================================================
+Date: 2026-03-28
+Target: https://github.com/serai-dex/serai
+Bounty: Immunefi - Up to $30K
+Audited Commit: HEAD of main branch (42 commits since 2025-08-01 in crypto/)
+Prior Audit: Cypher Stack, March 2023 (partial, crypto libraries)
+  - Report: github.com/serai-dex/cypherstack-serai-crypto-audit
+  - Finding: "No findings of particular immediate concern"
+
+================================================================================
+EXECUTIVE SUMMARY
+================================================================================
+
+The Serai cryptographic library is well-engineered with strong defensive coding.
+The code demonstrates awareness of subtle cryptographic pitfalls (cofactor
+handling, nonce reuse prevention, constant-time operations, zeroization).
+However, several areas of concern were identified ranging from informational
+to medium severity.
+
+Severity Scale: CRITICAL / HIGH / MEDIUM / LOW / INFORMATIONAL
+
+================================================================================
+FINDING #1: BINDING FACTOR REUSE ACROSS NONCES (MEDIUM)
+================================================================================
+
+File: crypto/frost/src/nonce.rs, lines 161-173
+Component: BindingFactor::calculate_binding_factors
+
+DESCRIPTION:
+The binding factor calculation generates ONE binding factor per nonce, but the
+comment on line 165-166 acknowledges uncertainty:
+
+  "It *should* be perfectly fine to reuse a binding factor for multiple nonces
+   This generates a binding factor per nonce just to ensure it never comes up
+   as a question"
+
+However, the implementation generates binding factors by calling
+`transcript.challenge(b"rho")` in a loop (line 169). Because the Transcript
+trait's `challenge()` method updates internal state after each call, each call
+returns a DIFFERENT value. This is correct.
+
+BUT: The transcript is cloned per-participant (line 163), and within each
+participant's loop, the same transcript state is used to derive ALL binding
+factors for that participant. The binding factor for nonce index `n` of
+participant `l` is deterministic from the transcript state, which includes the
+participant index.
+
+CONCERN: The transcript clone on line 163 starts with the rho_transcript that
+includes the group key, message hash, and commitment hash. The participant
+index is appended (line 164). Then `challenge(b"rho")` is called N times.
+Because DigestTranscript::challenge() forks the hash state with
+Continued/Challenged markers, each call produces a unique output. This appears
+sound.
+
+VERDICT: After deeper analysis, this is correctly implemented. The per-nonce
+binding factors are distinct and participant-specific. INFORMATIONAL only.
+
+================================================================================
+FINDING #2: HASH_TO_F DST TRANSPOSITION VULNERABILITY (MEDIUM)
+================================================================================
+
+File: crypto/dalek-ff-group/src/ciphersuite.rs, lines 31-33
+Component: Ristretto::hash_to_F / Ed25519::hash_to_F
+
+DESCRIPTION:
+The hash_to_F function is implemented as:
+  Scalar::from_hash(Sha512::new_with_prefix(&[dst, data].concat()))
+
+This is a naive concatenation with NO length prefix or separator. The code
+comments explicitly acknowledge this:
+  "hash_to_F is implemented with a naive concatenation of the dst and data,
+   allowing transposition between the two."
+
+IMPACT: If any two protocol uses of hash_to_F have DSTs where one is a prefix
+of another, an attacker could construct collisions. For example:
+  hash_to_F(b"abc", b"def") == hash_to_F(b"abcdef", b"")
+
+The FROST Curve trait mitigates this by prepending CONTEXT to all DSTs (see
+crypto/frost/src/curve/mod.rs line 57):
+  <Self as Ciphersuite>::hash_to_F(&[Self::CONTEXT, dst].concat(), msg)
+
+However, this creates a DOUBLE concatenation: CONTEXT || dst || msg, still
+without separators.
+
+SPECIFIC RISK: The MuSig binding factor uses:
+  C::hash_to_F(b"dkg-musig", &transcript)
+where `transcript` is a variable-length byte string containing context + keys.
+
+If the transcript content could be manipulated to collide with another DST's
+data, cross-protocol attacks are possible.
+
+EXPLOITABILITY: LOW - Requires finding two protocol paths with overlapping
+DST+data spaces. The fixed DST strings in practice prevent this.
+
+VERDICT: Known design limitation, documented. INFORMATIONAL for existing code.
+Could become MEDIUM if new protocol paths are added carelessly.
+
+================================================================================
+FINDING #3: MUSIG LACKS KEY CANCELLATION PROTECTION (INFORMATIONAL)
+================================================================================
+
+File: crypto/dkg/musig/src/lib.rs, lines 65-98
+Component: MuSig key aggregation (binding_factor, musig_key)
+
+DESCRIPTION:
+The MuSig implementation uses a binding factor scheme to prevent rogue-key
+attacks. Each participant's key is multiplied by a binding factor derived from
+the full list of keys:
+
+  binding_factor<C>(transcript, i) where transcript = context || n || key1..keyN
+
+This is consistent with the MuSig2 key aggregation approach where each key
+gets a unique coefficient derived from the full set.
+
+ANALYSIS: The binding factor is computed as:
+  C::hash_to_F(b"dkg-musig", &(transcript || i.to_le_bytes()))
+
+This includes the context (32 bytes), key count, all public keys, and the
+participant index. A rogue-key attacker would need to find a key K' such that:
+  binding_factor(K') * K' cancels the sum of other participants' contributions.
+
+Since the binding factor depends on K' itself (via the full key list), this
+requires solving a hash-inversion problem. This appears sound and consistent
+with MuSig2's security model.
+
+HOWEVER: The MuSig implementation stores the raw public key as the
+verification share (line 149):
+  verification_shares.insert(i, key);  // NOT binding_factor * key
+
+The binding factors are stored separately as the Interpolation::Constant
+coefficients. This means the ThresholdKeys stores:
+  - verification_shares[i] = raw_pubkey_i  (not aggregate-weighted)
+  - interpolation = Constant(binding_factors)
+
+When creating a ThresholdView, the interpolation_factor is applied:
+  verification_share * scalar * interpolation_factor
+
+This correctly produces the weighted key. But if the ThresholdKeys are
+serialized and the interpolation method is switched or misinterpreted, the
+verification shares would be wrong.
+
+VERDICT: Architecturally correct but the separation of binding factors from
+verification shares introduces fragility. INFORMATIONAL.
+
+================================================================================
+FINDING #4: NONCE COMMITMENT NOT CHECKED FOR IDENTITY (LOW)
+================================================================================
+
+File: crypto/frost/src/nonce.rs, lines 74-80
+Component: NonceCommitments::read
+
+DESCRIPTION:
+When reading nonce commitments from the wire, GeneratorCommitments::read
+(line 34-36) calls `<C as Curve>::read_G(reader)` which, via the Curve trait
+(crypto/frost/src/curve/mod.rs lines 125-131), DOES reject identity points:
+
+  fn read_G<R: Read>(reader: &mut R) -> io::Result<Self::G> {
+    let res = <Self as Ciphersuite>::read_G(reader)?;
+    if res.is_identity().into() {
+      Err(io::Error::other("identity point"))?;
+    }
+    Ok(res)
+  }
+
+VERDICT: Properly handled. The Curve::read_G rejects identity, and the
+Ciphersuite::read_G rejects non-canonical encodings. INFORMATIONAL - no issue.
+
+================================================================================
+FINDING #5: IETF TRANSCRIPT IS TRIVIALLY EXPLOITABLE IF MISUSED (MEDIUM)
+================================================================================
+
+File: crypto/frost/src/algorithm.rs, lines 103-126
+Component: IetfTranscript
+
+DESCRIPTION:
+The IetfTranscript implementation provides NO domain separation:
+  - domain_separate() is a no-op (line 112)
+  - append_message() ignores labels (line 113)
+  - challenge() returns the raw accumulated bytes (line 117)
+
+This means ALL messages are simply concatenated. If two different protocol
+messages have the same total byte length and content, they produce identical
+transcripts.
+
+ANALYSIS: This is intentional for IETF compatibility. The FROST signing code
+uses this transcript only for the IETF-specific signing flow. The rho_transcript
+used for binding factor computation uses a separate, properly domain-separated
+transcript (line 362 in sign.rs):
+  let mut rho_transcript = A::Transcript::new(b"FROST_rho");
+
+The IetfTranscript is used as the "algorithm transcript" to accumulate
+preprocesses. The preprocesses are then hashed via:
+  C::hash_commitments(self.params.algorithm.transcript().challenge(b"preprocesses"))
+
+Since challenge() on IetfTranscript ignores the label and returns raw bytes,
+these raw bytes are then hashed by hash_commitments(), providing the actual
+collision resistance.
+
+HOWEVER: The raw preprocess bytes include participant indices and commitment
+points appended in order. If a malicious participant could reorder or
+substitute these, they could potentially create a collision. Since
+participants are processed in sorted order (line 295 in sign.rs), and each
+participant's data has a fixed structure, this appears safe in practice.
+
+VERDICT: Correct for its intended use, but the IetfTranscript is dangerous
+if used outside the narrow IETF-compatible signing path. LOW.
+
+================================================================================
+FINDING #6: POTENTIAL PANIC IN BATCH BLAME WITH ALL-VALID SHARES (LOW)
+================================================================================
+
+File: crypto/multiexp/src/batch.rs, line 131
+Component: BatchVerifier::verify_with_vartime_blame
+
+DESCRIPTION:
+  pub fn verify_with_vartime_blame(&self) -> Result<(), Id> {
+    if self.verify() {
+      Ok(())
+    } else {
+      Err(self.blame_vartime().unwrap())  // <-- unwrap()
+    }
+  }
+
+If verify() returns false but blame_vartime() returns None, this will panic.
+blame_vartime() returns None if the slice is empty or if the single remaining
+element passes verification.
+
+SCENARIO: This could theoretically happen if:
+1. The constant-time verify() produces a different result from the individual
+   vartime checks in blame_vartime() due to floating-point-like differences.
+2. All individual shares are valid but the aggregate is not (e.g., due to
+   an overflow or accumulated rounding).
+
+In practice, group operations are exact (no floating point), so if the
+aggregate fails, at least one individual must fail. However, the batch
+verifier uses random weights, and the blame function tests SUBSETS, not
+individual items with weights. If the blame function's binary search happens
+to place two invalid items in the same half, it could miss one.
+
+ACTUAL RISK: The binary search in blame_vartime tests INDIVIDUAL items at the
+leaf level (line 120-122). If an individual item passes verification on its
+own but fails in combination (impossible for correctly weighted verification),
+this would be a problem. Since the weights are applied when queuing and become
+part of the stored data, individual verification uses the same weights. This
+means an item that passes individually MUST contribute correctly to the sum.
+
+HOWEVER: If the random weight happens to be the zero scalar (rejected by the
+while loop on line 83), this would allow an invalid share to pass. The zero
+check on line 83 prevents this.
+
+VERDICT: The unwrap() is safe given the mathematical properties. The code
+correctly prevents zero weights. INFORMATIONAL.
+
+================================================================================
+FINDING #7: ED25519 COFACTOR HANDLING IN DKG (INFORMATIONAL)
+================================================================================
+
+File: crypto/dalek-ff-group/src/lib.rs, lines 470-478
+Component: EdwardsPoint from_bytes with torsion check
+
+DESCRIPTION:
+The Ed25519 point deserialization includes a torsion-free check:
+
+  dalek_group!(
+    EdwardsPoint, DEdwardsPoint,
+    |point: DEdwardsPoint| point.is_torsion_free(),
+    ...
+  );
+
+The from_bytes function (line 430-436) checks:
+  choice(black_box(decompressed).is_some()) & choice($torsion_free(point))
+
+This means ALL deserialized Ed25519 points are verified to be in the
+prime-order subgroup. This prevents cofactor-related attacks in DKG shares.
+
+The Ristretto variant uses `|_| true` for torsion_free since Ristretto
+inherently provides a prime-order group.
+
+VERDICT: Properly handled. Ed25519 points are always checked for torsion
+components during deserialization. INFORMATIONAL - no issue.
+
+================================================================================
+FINDING #8: POLYNOMIAL EVALUATION USES HORNER'S METHOD CORRECTLY (INFO)
+================================================================================
+
+File: crypto/dkg/pedpop/src/lib.rs, lines 205-220
+Component: polynomial() function
+
+DESCRIPTION:
+The polynomial evaluation uses Horner's method in reverse order:
+  for (idx, coefficient) in coefficients.iter().rev().enumerate() {
+    *share += coefficient.deref();
+    if idx != (coefficients.len() - 1) {
+      *share *= l;
+    }
+  }
+
+This evaluates a_0 + a_1*x + ... + a_{t-1}*x^{t-1} by iterating from the
+highest coefficient down. Starting with a_{t-1}, it accumulates:
+  ((a_{t-1} * x + a_{t-2}) * x + ... + a_1) * x + a_0
+
+The `if idx != len-1` guard prevents an extra multiplication after adding a_0.
+
+VERDICT: Correct implementation of Horner's method. INFORMATIONAL.
+
+================================================================================
+FINDING #9: FELDMAN COMMITMENT VERIFICATION IN PEDPOP (INFORMATIONAL)
+================================================================================
+
+File: crypto/dkg/pedpop/src/lib.rs, lines 420-449
+Component: share_verification_statements / exponential
+
+DESCRIPTION:
+The share verification uses the exponential function to compute:
+  sum(commitment[j] * i^j for j in 0..t) == G * share
+
+The exponential function (line 420-428) correctly computes powers of i:
+  (0 .. values.len()).fold(C::F::ONE, |exp, l| {
+    res.push((exp, values[l]));
+    exp * i
+  });
+
+This produces [(1, C_0), (i, C_1), (i^2, C_2), ...] which is then used in
+a multiexp to verify the share.
+
+The share_verification_statements function creates a batch-verifiable equation:
+  sum(C_j * i^j) - G * share == 0
+
+VERDICT: Standard Feldman VSS verification, correctly implemented. INFO.
+
+================================================================================
+FINDING #10: ENCRYPTION KEY REUSE RISK IN DKG (LOW)
+================================================================================
+
+File: crypto/dkg/pedpop/src/encryption.rs, lines 99-133
+Component: cipher() / encrypt()
+
+DESCRIPTION:
+The encryption system uses ECDH + ChaCha20 with a per-message ephemeral key.
+The cipher function derives a ChaCha20 key from the ECDH shared secret using
+a transcript, then uses a STATIC IV (b"DKG IV v0.2\0").
+
+The comment on lines 120-123 explains:
+  "Since the key is single-use, it doesn't matter what we use for the IV.
+   The issue is key + IV reuse."
+
+ANALYSIS: Each message generates a fresh random scalar (line 153), producing
+a unique ECDH shared secret, and therefore a unique ChaCha20 key. The static
+IV is acceptable because key+IV uniqueness is maintained.
+
+HOWEVER: If the RNG is broken or produces duplicate values, two messages would
+use the same key+IV, enabling trivial XOR recovery of both plaintexts. This
+is a standard assumption (good RNG), but the defense-in-depth approach of
+also randomizing the IV would add resilience.
+
+VERDICT: Acceptable given the standard RNG assumption. LOW.
+
+================================================================================
+FINDING #11: SCHNORR AGGREGATE WEIGHT DERIVATION (INFORMATIONAL)
+================================================================================
+
+File: crypto/schnorr/src/aggregate.rs, lines 22-65
+Component: weight() function
+
+DESCRIPTION:
+The aggregation weight function derives a scalar from the transcript by loading
+bytes in 64-bit (8-byte) chunks and shifting. The number of bytes loaded is:
+  BYTES = ceil((F::NUM_BITS + 128) / 8)
+
+This provides >128 bits of entropy beyond the field size, ensuring negligible
+bias after reduction. If the challenge output is shorter than BYTES, additional
+challenges are requested.
+
+The implementation loads bytes big-endian via u64::from_be_bytes and uses
+additive doubling (res += res for 64 iterations per word) to shift.
+
+ANALYSIS: The shift-and-add approach is equivalent to wide reduction. For
+a 253-bit field (ed25519), BYTES = ceil(381/8) = 48. SHA-512 produces 64
+bytes per challenge, so one challenge suffices.
+
+VERDICT: Correctly implements unbiased weight derivation. INFORMATIONAL.
+
+================================================================================
+FINDING #12: MISSING EXPLICIT PARTICIPANT COUNT IN RHO TRANSCRIPT (LOW)
+================================================================================
+
+File: crypto/frost/src/sign.rs, lines 362-371
+Component: Rho transcript construction
+
+DESCRIPTION:
+The rho transcript is constructed as:
+  let mut rho_transcript = A::Transcript::new(b"FROST_rho");
+  rho_transcript.append_message(b"group_key", ...);
+  rho_transcript.append_message(b"message", ...);
+  rho_transcript.append_message(b"preprocesses", ...);
+
+Then per-participant binding factors are derived by:
+  transcript.append_message(b"participant", participant_index);
+  transcript.challenge(b"rho")
+
+The signing set size (number of participants) is NOT explicitly included in the
+rho transcript. It is implicitly committed via the "preprocesses" field (which
+is a hash of all participants' commitments).
+
+ANALYSIS: Because the preprocesses hash covers all participants' data, the
+signing set is implicitly bound. An attacker cannot add or remove participants
+without changing the preprocesses hash. However, explicit binding of the set
+size is a defense-in-depth measure recommended by the FROST specification.
+
+VERDICT: The implicit binding appears sufficient. LOW - defense-in-depth
+recommendation.
+
+================================================================================
+FINDING #13: MUSIG CONTEXT NOT BOUND TO SIGNING OPERATION (LOW-MEDIUM)
+================================================================================
+
+File: crypto/dkg/musig/src/lib.rs
+Component: musig() function
+
+DESCRIPTION:
+The MuSig key aggregation takes a `context: [u8; 32]` parameter that is
+included in the binding factor transcript. This context is meant to be unique
+per multisig instance.
+
+CONCERN: The context is user-supplied and there is no mechanism to enforce
+uniqueness. If two different MuSig groups use the same context with
+overlapping key sets, the binding factors would be identical, and the
+resulting ThresholdKeys would be equivalent. This could lead to cross-group
+signature replay if the same keys participate in multiple MuSig instances
+with the same context.
+
+The documentation notes (crypto/dkg/pedpop/src/lib.rs line 147):
+  "The context should be unique among multisigs."
+
+But this is a soft requirement with no enforcement.
+
+VERDICT: Application-level risk. The library correctly uses the context but
+cannot enforce uniqueness. LOW-MEDIUM depending on integration.
+
+================================================================================
+FINDING #14: CONSTANT-TIME STRAUS LEAKS TABLE INDICES VIA MEMORY ACCESS (INFO)
+================================================================================
+
+File: crypto/multiexp/src/straus.rs, lines 27-50
+Component: straus() constant-time variant
+
+DESCRIPTION:
+The constant-time straus function (line 27) accesses precomputed tables with:
+  res += tables[s][usize::from(groupings[s][b])];
+
+This is a table lookup indexed by secret scalar bits. While the scalar groupings
+are processed uniformly (no branch on zero), the table INDEX itself varies based
+on the scalar, potentially leaking information through cache timing attacks.
+
+ANALYSIS: For the constant-time multiexp to truly be constant-time, the table
+access should use constant-time conditional selection across all table entries.
+The vartime variant (straus_vartime) explicitly skips zero entries, but the
+"constant-time" variant still does data-dependent memory access.
+
+VERDICT: The "constant-time" multiexp is NOT fully constant-time due to table
+indexing. However, this is used for batch verification of public values, not
+for signing with secret keys. The signing operation uses the
+sign_share function which does `nonce.deref()` and scalar multiplication
+through the group library, which is expected to be constant-time.
+
+IMPACT: Minimal in practice because the constant-time multiexp is used for
+public verification. The secret key operations go through the standard
+group scalar multiplication. INFORMATIONAL.
+
+================================================================================
+FINDING #15: DEALER KEY GENERATION ALLOWS ZERO COEFFICIENTS (LOW)
+================================================================================
+
+File: crypto/dkg/dealer/src/lib.rs, lines 25-27
+Component: key_gen() coefficient generation
+
+DESCRIPTION:
+  for _ in 0 .. threshold.max(1) {
+    coefficients.push(Zeroizing::new(C::F::random(&mut *rng)));
+  }
+
+The dealer generates random coefficients using F::random() which CAN return
+zero (with negligible probability ~2^-252). Unlike the PedPoP DKG which uses
+C::random_nonzero_F(), the dealer allows zero coefficients.
+
+IMPACT:
+- If coefficient[0] (the secret) is zero, the group key would be the identity
+  point, which is detectable and would likely cause a protocol abort.
+- If a non-zero-index coefficient is zero, the polynomial has reduced degree,
+  meaning fewer than t shares might be needed to reconstruct. This reduces
+  the effective threshold.
+
+PROBABILITY: ~2^-252 per coefficient. Negligible in practice.
+
+VERDICT: LOW - negligible probability but inconsistent with PedPoP's defensive
+use of random_nonzero_F.
+
+================================================================================
+FINDING #16: NONCE GENERATION TIMING SIDE-CHANNEL (INFORMATIONAL)
+================================================================================
+
+File: crypto/frost/src/curve/mod.rs, lines 94-121
+Component: Curve::random_nonce
+
+DESCRIPTION:
+The nonce generation uses rejection sampling:
+  while {
+    res = hash_to_F(b"nonce", seed);
+    res.ct_eq(&F::ZERO).into()
+  } { ... }
+
+The ct_eq check is constant-time, but the LOOP ITSELF reveals whether a zero
+was generated (by timing the function). Since the probability of generating
+zero is ~2^-252, this is not practically exploitable.
+
+Additionally, the seed construction (line 111):
+  seed.extend(repr.as_ref());
+This extends the seed with the secret share representation on each iteration.
+The seed starts as 32 random bytes, then gets the secret share appended. This
+means the hash input includes the secret share, providing nonce-share binding.
+
+VERDICT: INFORMATIONAL. The timing of the rejection loop is not exploitable.
+
+================================================================================
+FINDING #17: SCHNORRKEL COMPATIBILITY LAYER (INFORMATIONAL)
+================================================================================
+
+File: crypto/schnorrkel/src/lib.rs
+
+This module adapts FROST signing to produce signatures compatible with
+Substrate's sr25519/Schnorrkel scheme. This is critical for the Serai
+blockchain integration.
+
+ANALYSIS NEEDED: A full review of the Schnorrkel compatibility would require
+examining how the nonce Y-coordinate parity is handled (recent commit
+5e60ea97: "Don't offset nonces yet negate to achieve an even Y coordinate").
+This suggests there was a recent fix to nonce handling for Schnorrkel
+compatibility.
+
+VERDICT: The recent nonce handling changes warrant closer review. Without
+seeing the full Schnorrkel adapter code, this is noted as a POTENTIAL area
+of concern. INFORMATIONAL.
+
+================================================================================
+RECENT CHANGES ANALYSIS (Since Aug 2025)
+================================================================================
+
+Key commits affecting crypto security:
+
+1. 9f84adf8 - "Smash dkg into dkg, dkg-[recovery, promote, musig, pedpop]"
+   - Major refactor splitting DKG into sub-crates
+   - Risk: Refactoring can introduce bugs at module boundaries
+   - Checked: Inter-module interfaces appear correct
+
+2. 38dd8cb1 - "Support taking arbitrary linear combinations of signing keys"
+   - Changed from simple additive offsets to full linear combinations
+   - This is a significant security-relevant change
+   - Checked: The scalar/offset application in ThresholdKeys appears correct
+
+3. 5e60ea97 - "Don't offset nonces yet negate to achieve an even Y coordinate"
+   - Schnorrkel nonce handling fix
+   - This suggests the prior code was applying offsets at the wrong stage
+
+4. b6edc94b - "Add dealer key generation crate"
+   - New trusted dealer DKG (see Finding #15)
+
+5. 677a2e57 - "Fix zeroization timeline in multiexp, cargo machete"
+   - Security-relevant fix to prevent secret data from persisting in memory
+
+6. 17c1d5cd - "Tweak multiexp to Zeroize points when invoked in constant time"
+   - Additional zeroization defense
+
+================================================================================
+OVERALL ASSESSMENT
+================================================================================
+
+CRITICAL FINDINGS: 0
+HIGH FINDINGS: 0
+MEDIUM FINDINGS: 0 (Finding #2 is documented/known, Finding #5 is by design)
+LOW FINDINGS: 4 (#10, #12, #13, #15)
+INFORMATIONAL: 13
+
+The Serai cryptographic library demonstrates strong security engineering:
+
+STRENGTHS:
+- Ed25519 torsion-free checks on all deserialized points
+- Proper Feldman VSS verification in PedPoP
+- Nonce commitment binding via transcript-based rho factors
+- MuSig rogue-key protection via hash-based binding factors
+- Extensive zeroization of secret material
+- Rejection of identity points in FROST wire format
+- Properly domain-separated Fiat-Shamir transcripts
+- Batch verification with random weights preventing cross-item cancellation
+- Secret share encryption with per-message ephemeral keys and PoP
+
+AREAS FOR IMPROVEMENT:
+- hash_to_F DST concatenation is fragile (known, documented)
+- Dealer key gen should use random_nonzero_F like PedPoP
+- Explicit signing set size in rho transcript (defense-in-depth)
+- MuSig context uniqueness enforcement
+
+NO EXPLOITABLE BUGS FOUND that would warrant a bounty submission.
+The codebase has been through a prior audit (Cypher Stack, March 2023) and
+the identified issues are either informational or require impractical attack
+conditions.
+
+RECOMMENDATION: Focus future audit effort on:
+1. The Schnorrkel compatibility layer (recent nonce changes)
+2. The new linear combination support for signing keys
+3. Integration code in the processor that USES these primitives
+4. Bitcoin-specific signing code (outside crypto/ directory)
+
+================================================================================
+END OF REPORT
+================================================================================

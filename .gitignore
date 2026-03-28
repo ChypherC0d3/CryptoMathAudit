@@ -26,3 +26,11 @@ __pycache__/
 targets/monero-oxide/
 targets/wormhole/
 tools/verify_zksync/
+targets/risc0/
+targets/serai/
+targets/sp1/
+targets/threshold/
+targets/zkverify/
+tools/verify_sp1/
+tools/verify_threshold/
+tools/verify_zkverify/

@@ -1,0 +1,512 @@
+================================================================================
+NEW BUG BOUNTY TARGETS - ROUND 2: CUSTOM CRYPTOGRAPHY FOCUS
+Generated: 2026-03-28
+Focus: Custom crypto implementations where EC math / field arithmetic skills apply
+================================================================================
+
+PREVIOUSLY AUDITED (SKIP):
+  - Hyperlane, Firedancer, ZKsync (Era + OS), Wormhole, monero-oxide, LayerZero
+
+================================================================================
+TOP 10 RANKED TARGETS (by: bounty * P(finding bug) * skill match)
+================================================================================
+
+----------------------------------------------------------------------
+#1  SERAI DEX - FROST / Schnorr / DKG Threshold Crypto
+----------------------------------------------------------------------
+Platform:       Immunefi
+Max Bounty:     $30,000 (Critical)
+Rewards:        Critical $30K | High $5K | Medium $1K | Low $250
+Language:       Rust (100% -- perfect for us)
+Live Since:     July 31, 2023 (scope expanded Aug 2025, Feb 2026)
+KYC Required:   Yes
+PoC Required:   Yes
+
+IN-SCOPE CRYPTO ASSETS (all Rust, all custom):
+  1. crypto/ciphersuite      - Ciphersuite abstraction layer
+  2. crypto/dkg/src           - Distributed Key Generation
+  3. crypto/frost              - Modular FROST (threshold Schnorr)
+  4. crypto/schnorrkel         - FROST-Schnorrkel (Substrate compatible)
+  5. crypto/schnorr            - Schnorr signature implementations
+  6. crypto/dalek-ff-group     - ff/group trait wrappers for curve25519-dalek
+  7. crypto/transcript         - Flexible transcript (Fiat-Shamir)
+  8. crypto/multiexp           - Multi-scalar multiplication
+  9. crypto/dkg/musig          - MuSig-based DKG (ADDED Aug 2025 - NEW!)
+  10. networks/bitcoin         - Bitcoin-Serai (ADDED Aug 2025 - NEW!)
+
+WHY #1 RANK:
+  - PERFECT skill match: EC math, Schnorr, field arithmetic, DKG, multiexp
+  - Custom implementations (not importing libraries)
+  - New scope additions (Aug 2025) = fresh unaudited code
+  - FROST is complex: nonce handling, share validation, aggregation
+  - Threshold crypto bugs = total fund loss (high impact)
+  - Prior audit only by Cypher Stack (March 2023) -- old, limited
+  - Related to monero-oxide (we already know the codebase)
+  - Rust-only = fewer competing researchers
+
+ATTACK SURFACE:
+  - FROST nonce reuse / bias in DKG
+  - MuSig key aggregation rogue-key attacks
+  - Multiexp timing side-channels or incorrect results
+  - Transcript domain separation failures (Fiat-Shamir)
+  - dalek-ff-group: incorrect trait implementations, edge cases
+  - Bitcoin-Serai: signature malleability, UTXO handling
+
+GitHub: https://github.com/serai-dex/serai
+Immunefi: https://immunefi.com/bug-bounty/serai/
+
+SCORE: bounty(6/10) * P(bug)(9/10) * skill(10/10) = 540
+
+----------------------------------------------------------------------
+#2  SUCCINCT SP1 - zkVM (STARK/FRI, Recursive Proofs)
+----------------------------------------------------------------------
+Platform:       Code4rena
+Max Bounty:     $150,000 (Critical)
+Rewards:        Critical $10K-$150K | High $2.5K-$10K | Med $500-$2.5K
+Language:       Rust (100%)
+Current Ver:    v6.0.0
+PoC Required:   Yes
+
+IN-SCOPE CODE:
+  1. sp1-core-executor      - RISC-V execution engine
+  2. sp1-core-machine       - STARK proof machine (constraints, AIR)
+  3. sp1-recursion           - Recursive STARK proofs
+  4. sp1-hypercube           - Hypercube sumcheck prover
+  5. sp1-zkvm                - zkVM interface
+  6. sp1-lib                 - Core library
+  7. slop                    - Supporting library
+
+WHY #2 RANK:
+  - HIGH bounty ($150K) + STARK/FRI = perfect crypto match
+  - Built on Plonky3 (recent soundness bugs found by LambdaClass!)
+  - SP1 v3 had CRITICAL soundness bug (Jan 2025) - pattern suggests more
+  - Polynomial commitment, FRI, Fiat-Shamir = our EC math skills apply
+  - Hypercube sumcheck = novel, likely underaudited
+  - Recursive STARKs = compounding complexity = more bugs
+  - Used by major rollups (Optimism, Arbitrum, Polygon) = high impact
+
+KNOWN PAST BUGS (pattern analysis):
+  - Plonky3 batched polynomial evaluation: missing Fiat-Shamir observation
+  - SP1 v3: incomplete proof flag + missing verification step
+  - These bugs = Fiat-Shamir domain separation, constraint checking
+  - Same class likely exists in v6 with new features
+
+ATTACK SURFACE:
+  - AIR constraint completeness (missing constraints)
+  - FRI commit-phase soundness
+  - Fiat-Shamir transcript manipulation
+  - Recursive verifier circuit soundness
+  - Hypercube sumcheck: incorrect evaluation, weight computation
+  - STARK-to-SNARK wrapper: BN254 pairing edge cases
+
+Code4rena: https://code4rena.com/bounties/succinct
+GitHub: https://github.com/succinctlabs/sp1
+
+SCORE: bounty(9/10) * P(bug)(7/10) * skill(9/10) = 567
+
+----------------------------------------------------------------------
+#3  RISC ZERO - zkVM (STARK/FRI/Groth16 Verifiers)
+----------------------------------------------------------------------
+Platform:       HackenProof
+Max Bounty:     $150,000 (Critical)
+Rewards:        Critical $10K-$150K | High $5K
+Language:       Rust (zkVM), Solidity (on-chain verifiers)
+Live Since:     March 28, 2024 (updated Jan 2026)
+
+IN-SCOPE:
+  - RISC Zero zkVM (full STARK prover/verifier)
+  - Blockchain Groth16 verifiers (separate program, since Jan 2025)
+  - DEEP-ALI protocol implementation
+  - Batched FRI protocol
+  - STARK-to-SNARK (Groth16/BN254) translator
+
+WHY #3 RANK:
+  - $150K max + STARK/FRI internals in scope = high value
+  - Custom STARK implementation (not reusing existing libraries)
+  - DEEP-ALI + batched FRI = complex, bug-prone
+  - Groth16 on-chain verifier = pairing math bugs possible
+  - Separate verifier program = focused attack surface
+  - 98-bit security target = potential for parameter errors
+
+ATTACK SURFACE:
+  - DEEP-ALI query phase: incorrect polynomial evaluation
+  - FRI folding: commitment/evaluation mismatches
+  - Groth16 verifier: pairing degeneracy, subgroup checks
+  - STARK-to-SNARK: BN254 edge cases, proof translation errors
+  - zkVM executor escapes, memory safety
+  - Receipt information leakage (ZK property violations)
+
+HackenProof: https://hackenproof.com/risc-zero
+GitHub: https://github.com/risc0/risc0
+
+SCORE: bounty(9/10) * P(bug)(6/10) * skill(9/10) = 486
+
+----------------------------------------------------------------------
+#4  THRESHOLD NETWORK (tBTC) - ECDSA Threshold Signatures
+----------------------------------------------------------------------
+Platform:       Immunefi
+Max Bounty:     $500,000 (Critical, capped at 10% of funds at risk)
+Rewards:        Critical min $10K, max $500K | per severity classification
+Language:       Solidity (on-chain), Go/Rust (off-chain signers)
+Live Since:     Active (no KYC required for payouts!)
+
+IN-SCOPE CRYPTO ASSETS:
+  - keep-network/keep-core/solidity/ecdsa  -- ECDSA threshold contracts
+  - keep-network/tbtc-v2                    -- tBTC bridge contracts
+  - threshold-network/solidity-contracts    -- Core contracts
+  - 52 total assets across multiple chains
+
+WHY #4 RANK:
+  - HIGHEST bounty potential ($500K) among our crypto targets
+  - ECDSA threshold signing = directly in our wheelhouse
+  - tBTC bridges = cross-chain signature verification bugs = huge impact
+  - Multi-chain deployment (Ethereum, Arbitrum, Optimism, Polygon, Solana,
+    Base, Starknet, SUI) = larger attack surface
+  - No KYC requirement = lower friction
+  - Threshold ECDSA is notoriously hard to implement correctly
+
+ATTACK SURFACE:
+  - Threshold ECDSA: nonce generation, share verification
+  - tBTC bridge: signature validation, redemption logic
+  - Cross-chain relay: signature replay across chains
+  - Key refresh protocol: share consistency
+  - On-chain ECDSA verification: ecrecover edge cases
+  - Staking/slashing: incorrect penalty for valid signatures
+
+Immunefi: https://immunefi.com/bug-bounty/thresholdnetwork/
+GitHub: https://github.com/keep-network/keep-core
+
+SCORE: bounty(10/10) * P(bug)(5/10) * skill(8/10) = 400
+
+----------------------------------------------------------------------
+#5  ZKVERIFY - Multi-Proof Verification Chain (Groth16/PLONK/FRI/STARK)
+----------------------------------------------------------------------
+Platform:       Immunefi
+Max Bounty:     $50,000 (Critical)
+Rewards:        Critical $15K-$50K | High $5K-$10K
+Language:       Rust (Substrate-based L1)
+Live Since:     September 5, 2025 (VERY NEW)
+KYC Required:   Yes (Level 2)
+PoC Required:   Yes
+
+IN-SCOPE:
+  - zkVerify blockchain (full Substrate chain)
+  - Verifier pallets for: Fflonk, Groth16 (BN128/BN254/BLS12-381),
+    UltraPlonk, UltraHonk, Risc0 STARK, SP1, Plonky2, EZKL, Halo2
+  - Multiple elliptic curves and pairing implementations
+
+WHY #5 RANK:
+  - VERY NEW (Sept 2025) = likely underaudited
+  - Every verifier is a separate attack surface
+  - Custom Rust implementations of pairing-based verification
+  - Groth16 across 3 curves (BN128, BN254, BLS12-381) = edge case paradise
+  - Mainnet launched recently (2026) = production code, real funds at risk
+  - Multiple proof system integrations = integration bugs
+  - Our Fflonk/Groth16 pairing knowledge directly applies
+
+ATTACK SURFACE:
+  - Groth16 verifier: subgroup checks, pairing computation, curve ops
+  - Fflonk verifier: polynomial evaluation, KZG commitment checks
+  - UltraPlonk: Noir/Barretenberg proof parsing, public input handling
+  - Cross-verifier: proof type confusion, shared state corruption
+  - Substrate pallet: weight calculation errors, storage manipulation
+  - Proof aggregation/batching: Merkle tree, attestation logic
+
+Immunefi: https://immunefi.com/bug-bounty/zkverify/
+GitHub: https://github.com/zkVerify/zkVerify
+
+SCORE: bounty(7/10) * P(bug)(8/10) * skill(9/10) = 504
+
+----------------------------------------------------------------------
+#6  EIGENLAYER - BLS Signature Aggregation / Restaking
+----------------------------------------------------------------------
+Platform:       Immunefi
+Max Bounty:     $2,000,000 (Critical)
+Language:       Solidity (contracts), Go (operator nodes)
+Live Since:     ~2023 (ongoing)
+
+IN-SCOPE:
+  - EigenLayer core contracts (restaking, delegation, slashing)
+  - BLS12-381 and BN254 signature verification
+  - AVS (Actively Validated Services) registration
+  - Operator key management and signature aggregation
+
+WHY #6 RANK:
+  - MASSIVE bounty ($2M) = highest potential payout
+  - BLS multi-signature aggregation = rogue-key attacks, subgroup issues
+  - BLS12-381 migration (post-Pectra) = new code paths
+  - AVS signature verification = custom per-service logic
+  - Heavily scrutinized but very complex = deep bugs remain
+  - Our BLS/pairing knowledge applies directly
+
+ATTACK SURFACE:
+  - BLS rogue-key attacks in multi-sig aggregation
+  - Proof-of-possession bypass
+  - BN254 <-> BLS12-381 migration edge cases
+  - Operator registration: key validation
+  - Slashing: incorrect BLS verification leading to wrongful slashing
+  - Cross-AVS signature replay
+
+Immunefi: https://immunefi.com/bounty/eigenlayer/
+Docs: https://docs.eigencloud.xyz/eigenlayer/security/bug-bounty
+
+SCORE: bounty(10/10) * P(bug)(3/10) * skill(7/10) = 210
+
+----------------------------------------------------------------------
+#7  AZTEC NETWORK - Custom PLONK (Barretenberg, Noir, TurboPlonk)
+----------------------------------------------------------------------
+Platform:       Immunefi (+ direct program)
+Max Bounty:     $1,000,000 each for smart contract AND cryptography bugs
+Language:       C++ (Barretenberg), Noir (circuits), Solidity
+Status:         Transitioning to next-gen zkRollup (2025-2026)
+
+IN-SCOPE:
+  - Barretenberg proving system (C++ PLONK implementation)
+  - Noir circuit compiler and standard library
+  - TurboPlonk / UltraPlonk proof generation and verification
+  - On-chain verifier contracts
+
+WHY #7 RANK:
+  - $1M bounty for crypto bugs = extremely high value
+  - Custom PLONK implementation (Barretenberg) = not OpenZeppelin
+  - History of paying large bounties ($450K paid to lucash-dev)
+  - C++ prover = memory safety issues on top of math bugs
+  - Next-gen rollup in development = fresh, unaudited code
+  - Noir ecosystem growing = more attack surface
+
+CAVEATS:
+  - Aztec Connect deprecated; new system may have updated scope
+  - Token launched Dec 2025 = project actively developing
+  - Scope may be in transition -- verify current active program
+
+ATTACK SURFACE:
+  - TurboPlonk gate constraints: missing/incorrect constraints
+  - Barretenberg: C++ memory corruption in field arithmetic
+  - KZG commitment scheme: incorrect polynomial evaluation
+  - Noir compiler: circuit optimization bugs introducing unsoundness
+  - On-chain verifier: Solidity pairing precompile edge cases
+
+Immunefi: https://immunefi.com/bounty/aztecnetwork/
+GitHub: https://github.com/AztecProtocol/barretenberg
+
+SCORE: bounty(10/10) * P(bug)(4/10) * skill(8/10) = 320
+
+----------------------------------------------------------------------
+#8  SCROLL - zkEVM (PLONK Verifiers, Halo2 Circuits)
+----------------------------------------------------------------------
+Platform:       Immunefi
+Max Bounty:     $1,000,000 (Critical, 10% of funds, min $50K)
+Language:       Go (l2geth), Solidity (contracts/verifiers), Rust (circuits)
+Live Since:     October 17, 2023 (updated May 2025)
+KYC Required:   Yes
+
+IN-SCOPE:
+  - 36 assets (blockchain/DLT + smart contracts)
+  - PlonkVerifierFull.sol / PlonkVerifierFullLarge.sol (via Linea -- sister)
+  - l2geth (Go node implementation)
+  - Bridge and rollup contracts
+  - Primacy of Impact applies for Critical/High
+
+WHY #8 RANK:
+  - $1M max bounty with $50K minimum for critical
+  - zkEVM = complex constraint system, Halo2-based circuits
+  - PLONK verifier contracts = pairing math in Solidity
+  - Multiple independent audits (Trail of Bits, Zellic, KALOS, OpenZeppelin)
+    but complexity means deep bugs survive audits
+  - Go node = different bug class than Solidity/Rust
+
+CAVEATS:
+  - zkEVM circuits may not be explicitly in Immunefi scope
+  - Primarily Go/Solidity (not our strongest languages)
+  - Heavily audited = lower probability of easy finds
+
+ATTACK SURFACE:
+  - PLONK verifier: incorrect pairing computation, subgroup checks
+  - zkEVM circuit: constraint underfitting, lookup table errors
+  - Bridge: cross-chain message verification
+  - Rollup: state transition proof acceptance
+
+Immunefi: https://immunefi.com/bug-bounty/scroll/
+Docs: https://docs.scroll.io/en/technology/security/audits-and-bug-bounty/
+
+SCORE: bounty(10/10) * P(bug)(3/10) * skill(6/10) = 180
+
+----------------------------------------------------------------------
+#9  LIGHT PROTOCOL - ZK Compression on Solana (Merkle Trees, ZK Proofs)
+----------------------------------------------------------------------
+Platform:       Immunefi
+Max Bounty:     $50,000 (Critical, 10% of funds)
+Language:       Rust (Solana programs), TypeScript
+Live Since:     Active
+
+IN-SCOPE:
+  - light_system_program (Solana program)
+  - account_compression_program (Merkle tree management)
+  - ZK proof verification for compressed state transitions
+  - Nullifier queue (double-spend prevention)
+  - Address queue and Merkle tree rollover
+
+WHY #9 RANK:
+  - ZK compression = novel primitive, likely bugs
+  - Merkle tree implementations = hash collision, path verification
+  - Nullifier handling = double-spend vulnerabilities
+  - Solana Rust programs = our strength
+  - Multiple audits done but "light-sdk-macros and light-sdk are unaudited"
+  - Relatively new concept = less researcher attention
+
+ATTACK SURFACE:
+  - Merkle tree: path validation, root computation
+  - Nullifier queue: double-spend bypass, ordering attacks
+  - ZK proof verification: incorrect constraint checking
+  - State compression: data integrity, decompression bugs
+  - Forester nodes: race conditions in queue emptying
+
+Immunefi: https://immunefi.com/bug-bounty/light-protocol/
+GitHub: https://github.com/Lightprotocol/light-protocol
+
+SCORE: bounty(7/10) * P(bug)(6/10) * skill(7/10) = 294
+
+----------------------------------------------------------------------
+#10  STACKS - Bitcoin L2 (sBTC, WSTS Threshold Signing, Clarity VM)
+----------------------------------------------------------------------
+Platform:       Immunefi
+Max Bounty:     $250,000 (Critical, 10% of damage, min $25K)
+Language:       Rust (node, signer), Clarity (smart contracts), Bitcoin Script
+Live Since:     March 31, 2022 (updated March 13, 2026)
+KYC Required:   Yes
+
+IN-SCOPE:
+  - sBTC signer implementation (Rust, added April 2025 -- NEW)
+  - sBTC Emily implementation (added April 2025 -- NEW)
+  - sBTC contracts (added April 2025 -- NEW)
+  - Main Stacks blockchain repository
+  - Node implementation (added Sept 2025 -- NEW)
+  - Blockchain shared libraries
+
+WHY #10 RANK:
+  - sBTC signer = threshold signing for Bitcoin bridge (NEW, April 2025)
+  - WSTS (Weighted Schnorr Threshold Signature) in scope via Attackathon
+  - Rust implementation = our strength
+  - Bitcoin Script integration = custom crypto edge cases
+  - Multiple new scope additions in 2025 = fresh code
+  - Two Attackathons already run ($250K each) = project invests in security
+  - sBTC = Bitcoin custody via threshold multisig = high-value target
+
+ATTACK SURFACE:
+  - WSTS: weighted threshold signature share validation
+  - sBTC signer: nonce management, key rotation
+  - Bitcoin Script: signature validation, UTXO handling
+  - Clarity VM: integer overflow, access control
+  - Cross-chain: Bitcoin tx construction, witness handling
+  - Node: consensus bugs, chain reorganization
+
+Immunefi: https://immunefi.com/bug-bounty/stacks/
+Attackathon II: https://immunefi.com/audit-competition/stacks-attackathon-2/
+
+SCORE: bounty(8/10) * P(bug)(5/10) * skill(7/10) = 280
+
+================================================================================
+ADDITIONAL TARGETS (Not ranked but worth monitoring)
+================================================================================
+
+MINA PROTOCOL (Kimchi Proof System)
+  Platform: HackenProof
+  Max: $10,000 (too low for focused effort)
+  Crypto: Kimchi (custom SNARK), recursive proofs, Poseidon hash
+  Language: Rust/OCaml
+  Notes: Mesa upgrade coming 2026, low bounty but interesting crypto
+  HackenProof: https://hackenproof.com/programs
+
+IRON FISH (Modified Sapling)
+  Platform: HackerOne
+  Crypto: Modified Zcash Sapling, ZK proofs, Poseidon
+  Language: Rust
+  Notes: Custom Sapling modifications for multi-asset, audited by Inversed Tech
+  HackerOne: https://hackerone.com/iron_fish_bbp
+
+ZCASH (Halo2 / Orchard)
+  Platform: Direct disclosure (no formal bounty found)
+  Crypto: Halo2 recursive proofs, Orchard shielded pool, Poseidon
+  Language: Rust
+  Notes: Formal verification grant application for Halo2 in Lean 4 (March 2026)
+         NU6.1 activated Nov 2025. No active bug bounty found on major platforms.
+  GitHub: https://github.com/zcash/halo2
+
+LINEA (ConsenSys zkEVM)
+  Platform: Immunefi
+  Max: $100,000
+  Crypto: PLONK verifiers (PlonkVerifierFull.sol, PlonkVerifierFullLarge.sol)
+  Language: Solidity (verifiers), Go (node)
+  Notes: Scope is primarily Solidity verifier contracts, not circuit internals
+  Immunefi: https://immunefi.com/bug-bounty/linea/
+
+POLYGON zkEVM
+  Platform: Immunefi
+  Crypto: Plonky2 (deprecated -> Plonky3), custom zkEVM circuits
+  Notes: Plonky2 deprecated, Plonky3 production-ready but bugs found
+  Immunefi: https://immunefi.com/bounty/polygonzkevm/
+
+PENUMBRA (Privacy DEX)
+  Crypto: Custom ZK proofs, threshold crypto for validators
+  Notes: No formal bug bounty program found on major platforms
+  Status: Check https://penumbra.zone for updates
+
+CELESTIA (Data Availability)
+  Notes: No Immunefi bug bounty found. May use direct disclosure only.
+  Status: Not crypto-focused enough for our specialization
+
+================================================================================
+RECOMMENDED PRIORITY ORDER FOR IMMEDIATE WORK
+================================================================================
+
+TIER 1 - START NOW (highest ROI for our skills):
+  1. SERAI DEX    - Perfect crypto match, new scope, Rust, FROST/DKG
+  2. SUCCINCT SP1 - High bounty, recent bugs found, STARK/FRI
+  3. ZKVERIFY     - Very new program, multiple verifiers, Rust
+
+TIER 2 - NEXT SPRINT:
+  4. RISC ZERO    - High bounty, STARK/FRI/Groth16, Rust
+  5. THRESHOLD    - Huge bounty potential, ECDSA threshold
+  6. STACKS       - New sBTC signer, WSTS threshold, Rust
+
+TIER 3 - OPPORTUNISTIC:
+  7. AZTEC        - Massive bounty but scope may be transitioning
+  8. EIGENLAYER   - Huge bounty but heavily audited
+  9. SCROLL       - High bounty but primarily Go/Solidity
+  10. LIGHT PROTO - ZK compression, moderate bounty
+
+================================================================================
+CROSS-PLATFORM CONTEST OPPORTUNITIES (Code4rena / Sherlock)
+================================================================================
+
+- Code4rena Token22: Confidential transfers using ElGamal in Solana's zk-sdk
+  (ACTIVE - check https://code4rena.com/audits)
+- Sherlock/Code4rena periodically host ZK circuit audits at $80K-$150K+ pools
+- ZK circuit audit premium: 80-120% above EVM baseline
+- Monitor: https://code4rena.com/audits and https://sherlock.xyz/solutions/audit-contests
+
+================================================================================
+KEY OBSERVATIONS
+================================================================================
+
+1. FROST/Schnorr threshold signatures (Serai, Stacks) are underserved --
+   fewer researchers audit this compared to ECDSA or BLS.
+
+2. STARK/FRI systems (SP1, RISC Zero, ZKsync OS) have had recent soundness
+   bugs -- this is a fertile area, especially Fiat-Shamir domain separation.
+
+3. Multi-proof verifiers (zkVerify) are new and combine multiple attack
+   surfaces in one codebase -- integration bugs are likely.
+
+4. The BLS signature space (EigenLayer) has the highest bounties but also
+   the most competition from researchers.
+
+5. Rust-only targets have significantly fewer competing researchers than
+   Solidity-heavy programs.
+
+6. Programs with scope updates in 2025-2026 (Serai, Stacks, zkVerify) have
+   the freshest code and highest probability of undiscovered bugs.
+
+================================================================================
+END OF REPORT
+================================================================================

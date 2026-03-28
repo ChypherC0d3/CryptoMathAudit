@@ -1,0 +1,194 @@
+============================================================
+INDEPENDENT SECURITY AUDIT: ZKSYNC BLOBBASEFEE/BLOBHASH
+REFRAMED VULNERABILITY CLAIM VERIFICATION
+Date: 2026-03-28
+============================================================
+
+1. L2 COMPARISON: HOW OTHER L2s HANDLE BLOBBASEFEE
+============================================================
+
+OPTIMISM:
+- BLOBBASEFEE returns 1 on L2 (hardcoded).
+- This is EXPLICITLY DOCUMENTED in the OP Stack Specification:
+  "BLOBBASEFEE always pushes 1 onto the stack."
+  (Source: specs.optimism.io/protocol/ecotone/overview.html)
+- Rationale is documented: derived from EIP-4844 MIN_BLOB_GASPRICE.
+- BLOBHASH: returns 0 (no blob transactions on L2).
+- KEY POINT: Optimism does NOT revert. It returns stub values.
+  But it DOCUMENTS this behavior explicitly.
+
+ARBITRUM:
+- BLOBBASEFEE returns 1 on L2 (always).
+- Arbitrum chains "don't have blob data markets" so the opcode
+  returns the minimum constant value.
+- Like Optimism, it does NOT revert. It returns a stub value.
+- This behavior is documented in ArbOS release notes.
+
+POLYGON zkEVM:
+- Aims for full EVM equivalence. Supports all standard opcodes.
+- Modified opcodes (SELFDESTRUCT, EXTCODEHASH) are documented
+  with their adjusted behavior.
+- For any truly unsupported opcodes, Polygon documents the
+  specific behavior.
+
+CRITICAL FINDING:
+Both Optimism and Arbitrum return the SAME values as ZKsync
+(BLOBBASEFEE=1, BLOBHASH=0). This is standard L2 behavior
+because L2s don't have blob markets. The difference is that
+Optimism and Arbitrum EXPLICITLY DOCUMENT these return values,
+while ZKsync only says "unsupported" without specifying what
+happens at runtime.
+
+2. IMMUNEFI PRECEDENTS & PROGRAM RULES
+============================================================
+
+ZKsync OS Bounty Program:
+- Medium severity: "Undocumented deviation from EVM behavior
+  (not related to gas)" -- fixed $5,000 reward.
+- Known issue exclusion: "Bug reports covering previously-
+  discovered bugs are not eligible."
+- BUT: ZKsync commits to Known Issue Assurance, meaning they
+  must prove an issue was previously known via public disclosure
+  or self-reported bug submission.
+- Promotional bug: ZKsync intentionally planted a Medium-level
+  bug. This may or may not be the BLOBBASEFEE/BLOBHASH issue.
+
+Immunefi Known Issue Policy:
+- Projects MUST provide evidence when closing a report as known.
+- Acceptable evidence: previous bug report, GitHub issue, PR,
+  or other documented evidence.
+- If no evidence is provided, the report is considered valid
+  and in-scope.
+
+3. ZKSYNC DOCUMENTATION ANALYSIS
+============================================================
+
+What the docs actually say:
+- "The following opcodes remain unsupported due to underlying
+  limitations of EraVM: CALLCODE, SELFDESTRUCT, BLOBHASH,
+  BLOBBASEFEE."
+- "Opcodes and precompiles: CALLCODE, SELFDESTRUCT, BLOBHASH,
+  BLOBBASEFEE [...] are not supported as they're not implemented
+  in EraVM yet."
+
+What the docs DO NOT say:
+- No mention of what "unsupported" means at runtime
+- No mention that BLOBBASEFEE returns 1
+- No mention that BLOBHASH returns 0
+- No explicit statement that these opcodes revert
+- No explicit statement that these opcodes return stub values
+
+The word "unsupported" is ambiguous. In EVM context:
+- A truly unsupported opcode (undefined opcode) causes REVERT
+- "Not implemented yet" suggests it will be added later
+- Neither implies "silently returns a wrong value"
+
+4. STRENGTH OF THE "SILENT FAIL vs REVERT" ARGUMENT
+============================================================
+
+STRENGTHS:
+(a) The behavior IS undocumented. The docs say "unsupported"
+    but don't say "returns 1" or "returns 0." A developer
+    reading "unsupported" would reasonably expect a revert.
+
+(b) The Medium severity category literally says "Undocumented
+    deviation from EVM behavior (not related to gas)." The
+    actual runtime behavior (return 1 / return 0) deviates
+    from both:
+    - Ethereum L1 behavior (where BLOBBASEFEE returns the
+      actual blob base fee, not 1)
+    - The expected "unsupported" behavior (revert)
+
+(c) Silent data corruption angle is valid: a contract checking
+    BLOBBASEFEE to determine if blobs are cheap would get
+    incorrect data without any error signal.
+
+WEAKNESSES:
+(a) BLOBBASEFEE returning 1 is INDUSTRY STANDARD for L2s.
+    Optimism and Arbitrum do the same thing. ZKsync returning
+    1 is actually the correct L2 behavior -- the problem is
+    only that it's undocumented.
+
+(b) The team will likely argue:
+    - "Unsupported" is sufficient warning
+    - Returning 1 is the MIN_BLOB_GASPRICE, which is rational
+    - No blob transactions exist on L2, so the values are moot
+    - The practical impact is negligible
+
+(c) The "silent data corruption" scenario is theoretical. In
+    practice, EIP-4844-aware contracts on ZKsync would need to
+    deal with the absence of blob transactions regardless.
+
+(d) There may already be a fix on dev branch, which could be
+    used as evidence of a known issue.
+
+(e) SELFDESTRUCT is also listed as "unsupported" but actually
+    behaves per EIP-6780 (modified, not reverting). This shows
+    ZKsync uses "unsupported" loosely, weakening the argument
+    that developers would interpret it as "reverts."
+
+5. RISK ASSESSMENT
+============================================================
+
+The core vulnerability claim rests on:
+"The documentation says unsupported, but the implementation
+silently returns values instead of reverting."
+
+Counter-risk factors:
+- ZKsync planted a Medium bug intentionally. If THIS is that
+  planted bug, submitting it could win the promotional bounty.
+  If it's NOT the planted bug, it competes with that program.
+- The team could argue "unsupported" encompasses "returns
+  default/stub values" and is therefore documented.
+- The fix already existing on dev suggests the team knows
+  about it, and they could self-report it as known.
+- Returning 1 for BLOBBASEFEE matches Optimism/Arbitrum,
+  making it hard to argue this is "wrong" behavior -- it's
+  just undocumented behavior.
+
+============================================================
+VERDICT: DO NOT SUBMIT
+Confidence: MEDIUM
+Risk of rejection: HIGH
+
+Reasoning:
+
+1. The behavior (BLOBBASEFEE=1, BLOBHASH=0) is standard across
+   all major L2s (Optimism, Arbitrum). ZKsync is doing the same
+   thing as its competitors. The only gap is documentation, not
+   implementation.
+
+2. The "undocumented deviation" argument has some merit because
+   the docs say "unsupported" without defining runtime behavior.
+   However, the team has strong counterarguments:
+   - "Unsupported" is a sufficient developer warning
+   - The values returned match industry-standard L2 behavior
+   - The practical impact is negligible (no blob txs on L2)
+
+3. The fix already existing on a dev branch is a significant
+   risk factor. Under Immunefi rules, if ZKsync can point to a
+   GitHub commit or PR predating your report, it qualifies as a
+   known issue and will be rejected without reward.
+
+4. The severity framing as "silent data corruption" is
+   theoretical. No realistic attack scenario exists where a
+   contract on ZKsync L2 would be materially harmed by
+   BLOBBASEFEE returning 1 instead of reverting, because:
+   - There are no blob transactions on L2
+   - Any EIP-4844-aware contract would need adaptation for L2
+     regardless of whether the opcode reverts or returns 1
+
+5. If you do submit, the most likely outcome is rejection as
+   either (a) a known/documented issue, or (b) an issue with
+   insufficient practical impact to qualify as a meaningful
+   "deviation." The $5,000 Medium bounty does not justify the
+   effort and reputation risk of a rejected submission.
+
+ALTERNATIVE RECOMMENDATION:
+If you still want to pursue this, focus investigation on
+whether the dev branch fix was committed BEFORE or AFTER this
+analysis. If no prior evidence exists (no GitHub issue, no PR,
+no self-report on Immunefi), the Known Issue Assurance policy
+would work in your favor. But the industry-standard behavior
+argument remains a strong rejection basis regardless.
+============================================================
