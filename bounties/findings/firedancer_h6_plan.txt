@@ -1,0 +1,215 @@
+===============================================================================
+HYPOTHESIS H6: AVX512 vs Reference Ed25519 Implementation Divergence
+===============================================================================
+Date: 2026-03-28
+Status: TEST PLAN READY (not yet executed -- requires Linux AVX512 machine)
+
+===============================================================================
+1. ARCHITECTURE ANALYSIS
+===============================================================================
+
+Firedancer selects Ed25519 implementation at compile time via preprocessor:
+
+  fd_f25519.h:21-25:
+    #if FD_HAS_AVX512
+    #include "avx512/fd_f25519.h"
+    #else
+    #include "ref/fd_f25519.h"
+    #endif
+
+This means EVERY Firedancer validator running on an AVX512 CPU (Intel Skylake+,
+i.e., virtually all datacenter hardware since 2017) uses COMPLETELY DIFFERENT
+field arithmetic code than validators on older hardware.
+
+REFERENCE IMPLEMENTATION (ref/):
+  - Field element: 5x51-bit limbs in ulong[5] (or 10x26-bit in uint[10])
+  - Source: fiat-crypto generated (provably correct modular arithmetic)
+  - Carry propagation: fiat_25519_carry() -- formally verified
+  - Multiplication: fiat_25519_carry_mul() -- formally verified
+  - Point storage: 4 separate fd_f25519_t members (X, Y, Z, T)
+
+AVX512 IMPLEMENTATION (avx512/):
+  - Field element: 6x43-bit limbs in a 512-bit AVX vector (wwl_t / fd_r43x6_t)
+  - Source: Hand-written by Firedancer team
+  - Multiple representation forms: arbitrary, signed, unsigned, unreduced,
+    unpacked, nearly reduced, reduced (see fd_r43x6.h lines 30-100)
+  - Carry propagation: fold_unsigned / fold_signed (hand-tuned)
+  - Multiplication: FD_R43X6_MUL{1,2,3,4}_INL macros
+  - Point storage: 4 elements interleaved in 3 wwl_t vectors (QUAD format)
+    using P03, P14, P25 naming convention
+
+KEY STRUCTURAL DIFFERENCE:
+  The AVX512 path packs 4 field elements into 3 AVX-512 vectors, processing
+  all coordinates simultaneously. The reference path processes them sequentially.
+  This means the AVX512 point addition (FD_R43X6_GE_ADD) is entirely different
+  code from the reference (fd_ed25519_point_add_with_opts).
+
+===============================================================================
+2. SHARED CODE (same for both backends)
+===============================================================================
+
+The following code is SHARED and uses the dispatched field/point operations:
+  - fd_ed25519_verify() in fd_ed25519_user.c
+  - fd_ed25519_point_frombytes() in fd_curve25519.c
+  - fd_f25519_sqrt_ratio() in fd_f25519.c
+  - fd_f25519_pow22523() in fd_f25519.c
+  - fd_f25519_inv() in fd_f25519.c
+  - fd_ed25519_scalar_mul() in fd_curve25519.c
+  - fd_ed25519_double_scalar_mul_base() in fd_curve25519.c
+
+These shared functions call field operations (mul, sqr, add, sub) which
+dispatch to different backends. The scalar multiplication also calls point
+operations (add, dbl) which differ between backends.
+
+===============================================================================
+3. DIVERGENCE RISK ANALYSIS
+===============================================================================
+
+RISK 1: is_zero / equality checks [MEDIUM]
+  ref/fd_f25519.h:219-266: Checks el == 0 OR el == {p limbs}
+  avx512/fd_f25519.h:157-161: Checks el == fd_r43x6_zero() OR el == fd_r43x6_p()
+  Issue: Both only check TWO representations. If an intermediate result produces
+  a THIRD representation of zero (e.g., 2p, -p, etc.), both would fail.
+  However, both paths reduce before comparison, so this is likely safe.
+  But: are the reduction functions (fold_signed vs fiat_carry) equivalent?
+
+RISK 2: Non-reduced intermediates affecting branches [MEDIUM-HIGH]
+  The verify path has conditional branches dependent on field element values:
+  - fd_f25519_sgn(x) in point decompression (line 53 of fd_curve25519.c)
+  - fd_f25519_is_zero(x) in point decompression failure check
+  - fd_f25519_eq() in sqrt_ratio verification
+  - fd_ed25519_point_eq_z1() in final verify comparison
+
+  If the AVX512 and reference paths produce different intermediate
+  representations that are mathematically equal but have different sign bits
+  before proper reduction, the branches could diverge.
+
+RISK 3: tobytes canonicalization differences [HIGH]
+  ref: fiat_25519_to_bytes() -- provably produces canonical output
+  avx512: fd_r43x6_pack(fd_r43x6_mod(a->el)) -- relies on fd_r43x6_mod
+
+  fd_r43x6_mod maps arbitrary -> reduced (unique canonical form).
+  If fd_r43x6_mod has any edge case bug, tobytes could produce different
+  bytes, which would make the verify equation comparison fail differently.
+
+RISK 4: Point addition formulas [MEDIUM]
+  ref: Uses add_with_opts with skip_last_mul optimization
+  avx512: Uses FD_R43X6_GE_ADD macro (completely different code structure)
+
+  Both claim to implement the same formulas from eprint 2008/522, but the
+  intermediate reduction/folding steps are different. The ref path uses
+  add_nr/sub_nr (no reduction) before mul, while AVX512 uses
+  QUAD_FOLD_SIGNED between operations.
+
+RISK 5: Precomputed tables [LOW]
+  table/fd_curve25519_table_ref.c vs table/fd_curve25519_table_avx512.c
+  These contain the same mathematical values in different representations.
+  If generated correctly, they should produce identical results.
+  But: if the table generation used one backend and verification uses another,
+  there could be latent bugs.
+
+RISK 6: eq_z1 optimization difference [MEDIUM]
+  ref: fd_ed25519_point_eq_z1 cross-multiplies with b->Z (even though Z==1)
+  avx512: fd_ed25519_point_eq_z1 just calls fd_ed25519_point_eq (no optimization)
+
+  This means the ref path computes X1*1 and Y1*1 (trivial multiplications)
+  while the avx512 path computes full cross-multiplications. The extra
+  multiplications could cause different intermediate values that are
+  mathematically equal but might be detected differently by is_nonzero.
+
+===============================================================================
+4. EXISTING DIFFERENTIAL TESTING
+===============================================================================
+
+Firedancer has fuzz_ed25519_sigverify_diff.c which tests FIREDANCER vs DALEK.
+This does NOT test ref vs AVX512. It always runs whichever backend is compiled.
+
+Key gap: On an AVX512 CI machine, this fuzzer tests AVX512-vs-dalek.
+On a non-AVX512 CI machine, it tests ref-vs-dalek.
+NOBODY is testing ref-vs-AVX512 directly.
+
+Their test_r43x6.c tests the r43x6 primitives against known values, but
+does not compare against the reference implementation output.
+
+Their test_ed25519.c runs Wycheproof and other test vectors, but again
+only against whichever backend is compiled.
+
+===============================================================================
+5. TEST PLAN (created files)
+===============================================================================
+
+All files at: F:\Claude\BugBounty\targets\firedancer\h6_test\
+
+a) test_h6_vectors.c
+   - 38+ static test vectors from H1-H5 campaign
+   - Plus H6-specific field edge cases targeting r43x6 limb boundaries:
+     values near 2^43, 2^86, 2^129, 2^172, 2^215
+   - Tests fd_ed25519_verify() + point decompression + reserialize round-trip
+   - Reports PASS/FAIL against expected results
+
+b) test_h6_inline_diff.c
+   - Tests field arithmetic consistency (frombytes -> tobytes idempotency)
+   - Tests field operations (mul, add, sub, sqr) produce canonical output
+   - Tests point decompression round-trip
+   - 14 edge-case field values including p, p+/-1, limb boundaries, sqrt(-1)
+
+c) test_h6_fuzz.c
+   - 5 fuzz tests, configurable iterations (default 10M):
+     1. Sign-then-verify consistency (must always ACCEPT)
+     2. Random signature rejection (must never falsely ACCEPT)
+     3. Field arithmetic identities (a*1==a, a+0==a, a-a==0, a*a==sqr(a))
+     4. Point decompression round-trip
+     5. sqrt_ratio verification (v*r^2 == u when was_square)
+   - Prints full reproducer on any failure
+
+d) test_h6_avx512.sh
+   - Automated build script: clones repo, patches build system, compiles, runs
+   - Supports: --clone, --fuzz-iters N, --sde (Intel SDE emulation), --ref-only
+   - Also runs Firedancer's own test_ed25519, test_r43x6
+
+e) README.md
+   - Setup instructions for Vast.ai, AWS, bare metal
+   - Cost estimates
+
+===============================================================================
+6. EXECUTION PLAN AND COST
+===============================================================================
+
+Option 1: Vast.ai (~$0.30/hr)
+  - Most RTX 3090/4090 hosts have Xeon CPUs with AVX512
+  - Total time: ~45 min (build 5min + tests 10min + fuzz 30min)
+  - Total cost: ~$0.50
+
+Option 2: AWS c5.large spot (~$0.03/hr)
+  - Xeon Skylake with AVX512F
+  - Total cost: ~$0.10
+
+Option 3: Any modern Linux server
+  - Check: grep avx512f /proc/cpuinfo
+  - Free if you have access
+
+RECOMMENDED APPROACH:
+  1. Run test_h6_vectors.c on AVX512 machine -> compare output byte-for-byte
+     with same program compiled on non-AVX512 (or force FD_HAS_AVX512=0)
+  2. Run test_h6_fuzz.c for 100M+ iterations on AVX512
+  3. Save all outputs for analysis
+  4. If any divergence found: reproduce with minimal input, file report
+
+===============================================================================
+7. ASSESSMENT OF FINDING PROBABILITY
+===============================================================================
+
+MEDIUM probability of finding a consensus-splitting bug:
+  + Two completely independent codebases for critical crypto
+  + Hand-written AVX512 code (not formally verified like fiat-crypto)
+  + Complex representation with multiple forms (7 different limb ranges)
+  + No existing ref-vs-AVX512 differential test in CI
+  - Firedancer team is sophisticated; they run test_r43x6 and their dalek fuzzer
+  - The same high-level algorithms are used (just different field arithmetic)
+  - The code has been in production for months
+
+The most likely divergence would be in edge cases around:
+  - Non-canonical point encodings (y >= p)
+  - Field elements that are zero in unusual representations
+  - Points with zero coordinates
+  - The sqrt_ratio function (most complex computation, ~250 operations)

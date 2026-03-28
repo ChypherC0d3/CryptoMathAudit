@@ -1,0 +1,323 @@
+WORMHOLE VAA SIGNATURE VERIFICATION AUDIT
+==========================================
+Date: 2026-03-28
+Target: Wormhole VAA (Verifiable Action Approval) signature verification
+Repository: https://github.com/wormhole-foundation/wormhole (cloned to F:\Claude\BugBounty\targets\wormhole\wormhole)
+
+SCOPE VERIFICATION:
+===================
+Source: https://immunefi.com/bug-bounty/wormhole/
+Program: Active, max bounty $1,000,000 in W tokens, last updated 2026-03-17.
+KYC required: Yes. PoC required: Yes.
+
+In-scope assets relevant to VAA verification:
+  1. Guardian Nodes (Go) - github.com/wormhole-foundation/wormhole/tree/main/node
+  2. Ethereum (Solidity) - github.com/wormhole-foundation/wormhole/tree/main/ethereum
+  3. Solana (Rust) - github.com/wormhole-foundation/wormhole/tree/main/solana
+  4. Aptos (Move) - github.com/wormhole-foundation/wormhole/tree/main/aptos
+  5. Sui (Move) - github.com/wormhole-foundation/wormhole/tree/main/sui
+  6. CosmWasm (Rust) - github.com/wormhole-foundation/wormhole/tree/main/cosmwasm
+  7. Near (Rust) - github.com/wormhole-foundation/wormhole/tree/main/near
+
+CONCLUSION: VAA signature verification is CLEARLY IN SCOPE across all chain implementations.
+
+========================================================================
+FILES AUDITED:
+========================================================================
+EVM:     ethereum/contracts/Messages.sol (verifySignatures, parseVM, quorum)
+         ethereum/contracts/Structs.sol (Signature, GuardianSet, VM structs)
+Solana:  solana/bridge/program/src/api/verify_signature.rs (verify_signatures)
+         solana/bridge/program/src/api/post_vaa.rs (post_vaa, quorum calc)
+SVM:     svm/wormhole-core-shims/programs/verify-vaa/src/lib.rs (process_verify_hash)
+Aptos:   aptos/wormhole/sources/vaa.move (parse, verify, parse_and_verify, quorum)
+         aptos/wormhole/sources/guardian_pubkey.move (from_signature / ecrecover)
+Sui:     sui/wormhole/sources/vaa.move (parse_and_verify, verify_signatures)
+         sui/wormhole/sources/resources/guardian.move (verify, ecrecover)
+         sui/wormhole/sources/resources/guardian_set.move (quorum)
+Near:    near/contracts/wormhole/src/lib.rs (parse_and_verify_vaa, quorum)
+CosmWasm: cosmwasm/contracts/wormhole/src/contract.rs (parse_and_verify_vaa)
+          cosmwasm/contracts/wormhole/src/state.rs (quorum)
+Go SDK:  sdk/vaa/structs.go (verifySignatures, verifySignature, VerifySignatures, Verify)
+         sdk/vaa/quorum.go (CalculateQuorum)
+
+========================================================================
+AUDIT CHECKLIST RESULTS:
+========================================================================
+
+a) SIGNATURE MALLEABILITY (is s > n/2 rejected?)
+-------------------------------------------------
+Status: NOT CHECKED by Wormhole in any implementation.
+
+EVM (Messages.sol line 116): Uses raw ecrecover(hash, v, r, s) without
+checking that s is in the lower half of the curve order. Solidity's ecrecover
+does NOT reject malleable signatures. However, OpenZeppelin's ECDSA.sol does.
+
+Impact assessment: LOW/INFORMATIONAL. Signature malleability allows creating
+a second valid signature from an existing one (by flipping s to n-s and
+adjusting v). However, Wormhole's verification compares the recovered address
+against the guardian's stored address. A malleable signature would recover to
+the SAME address. The only impact would be if someone used the signature bytes
+themselves as a unique identifier, but Wormhole uses the VAA hash
+(keccak256(keccak256(body))) for replay protection, which is not affected by
+signature malleability.
+
+All other implementations (Solana secp256k1_program, Aptos ecdsa_recover, Sui
+ecdsa_k1::secp256k1_ecrecover, Near env::ecrecover, Go crypto.Ecrecover) also
+do NOT reject malleable signatures at the application level. This is consistent
+across all chains and does not create a cross-chain discrepancy.
+
+VERDICT: Not a vulnerability. The ecrecover approach means malleability does
+not change the recovered address. This is a known design choice.
+
+b) GUARDIAN INDEX VALIDATION (can you use same guardian twice?)
+--------------------------------------------------------------
+Status: PROPERLY PROTECTED in all implementations.
+
+All implementations enforce strictly increasing guardian indices:
+  - EVM: "signature indices must be ascending" (Messages.sol line 122)
+         Uses lastIndex (uint8, starts at 0), requires sig.guardianIndex > lastIndex
+         for i > 0. This prevents duplicate and out-of-order signatures.
+  - Go:  int(sig.Index) <= last_index check (structs.go line 593-594)
+         Also has a separate signing_addresses dedup check (belt and suspenders).
+  - Solana old: Accumulates boolean array of verified indices, not index-ordered.
+         But only 'true' flags are counted for quorum, so duplicates are harmless.
+  - SVM shim: index <= last_index check (lib.rs line 278)
+  - Aptos: guardian_index > last_index check (vaa.move line 182)
+  - Sui:   guardian_index > *option::borrow(&last_guardian_index) (vaa.move line 355)
+  - Near:  index <= last_index check (lib.rs line 168)
+  - CosmWasm: index <= last_index check (contract.rs line 196)
+
+VERDICT: No vulnerability. All implementations prevent duplicate guardian usage.
+
+c) GUARDIAN SET EXPIRY HANDLING
+-------------------------------
+Status: PROPERLY HANDLED in all implementations.
+
+All implementations check that the guardian set hasn't expired before
+accepting signatures:
+  - EVM: guardianSetIndex != currentIndex && expirationTime < block.timestamp
+         (Messages.sol line 80). Allows current set OR non-expired previous sets.
+  - Solana old: Checks expiration_time against clock (post_vaa.rs line 167)
+  - SVM shim: guardian_set.is_active(timestamp) (lib.rs line 253)
+  - Aptos: state::guardian_set_is_active() (vaa.move line 164)
+  - Sui: guardian_set::is_active(set, the_clock) (vaa.move line 332)
+  - Near: expiration_time < env::block_timestamp() (lib.rs line 143-144)
+  - CosmWasm: expiration_time < block_time (contract.rs line 180)
+
+Note: EVM has a nuance -- it allows the current guardian set index regardless
+of expiration. This is intentional since the current set should always be valid.
+
+VERDICT: No vulnerability.
+
+d) VAA HASH COMPUTATION (domain separation, cross-chain replay)
+---------------------------------------------------------------
+Status: CONSISTENT across all implementations.
+
+All implementations compute: hash = keccak256(keccak256(body))
+where body = timestamp || nonce || emitter_chain || emitter_address ||
+             sequence || consistency_level || payload
+
+  - EVM: keccak256(abi.encodePacked(keccak256(body))) (Messages.sol line 186)
+  - Aptos: keccak256(keccak256(body)) (vaa.move line 83)
+  - Sui: keccak256(keccak256(body)) via double_keccak256 (vaa.move line 308-311)
+  - Near: keccak256(keccak256(data[pos..])) (lib.rs line 156-157)
+  - CosmWasm: same pattern in ParsedVAA::deserialize
+  - Go: doubleKeccak(body) in SigningDigest (structs.go line 551)
+
+IMPORTANT OBSERVATION - NO DOMAIN SEPARATION:
+The VAA body does NOT include the guardian set index in the hash. This means
+a VAA signed by guardian set N can be presented to a chain still accepting
+guardian set N. However, this is by design -- the VAA is a message attestation,
+not a chain-specific authorization. Cross-chain replay is prevented by the
+emitter_chain field in the body. Same-chain replay is protocol-specific (each
+bridge contract tracks consumed VAAs separately).
+
+The version field is NOT part of the hash (noted in Messages.sol line 152).
+Since only version 1 is accepted, this is not currently exploitable, but the
+code comments acknowledge this as a design debt.
+
+VERDICT: No vulnerability. Design is intentional and well-documented.
+
+e) QUORUM CALCULATION (off-by-one?)
+------------------------------------
+Status: TWO DIFFERENT FORMULAS EXIST but produce identical results.
+
+Formula A (used in EVM, Go, Aptos, Sui, SVM shim, Rust SDK):
+  quorum = (numGuardians * 2) / 3 + 1
+
+Formula B (used in Near, CosmWasm, Solana old bridge):
+  quorum = ((numGuardians * 10 / 3) * 2) / 10 + 1
+
+Mathematical analysis for all values 0-255:
+  Formula A: (n*2)/3 + 1
+  Formula B: ((n*10/3)*2)/10 + 1
+
+  These are algebraically equivalent for integer arithmetic because:
+  Formula B = (floor(n*10/3) * 2) / 10 + 1
+  = floor(floor(n*10/3) * 2 / 10) + 1
+
+  Verified for n=1..255: both formulas produce identical results.
+  For n=19 (current guardian set): both yield 13 (2/3+1 quorum).
+
+EVM also has: require(numGuardians < 256, "too many guardians")
+This prevents overflow since guardianSetIndex is stored as uint8.
+
+SPECIAL CASE - CosmWasm and Near with 0 guardians:
+  CosmWasm returns quorum=0 for empty set (explicit check in state.rs line 216)
+  But the guardian set should never be empty in production.
+  EVM checks guardianSet.keys.length == 0 explicitly (Messages.sol line 75).
+
+VERDICT: No vulnerability. All formulas are equivalent for valid inputs.
+
+f) SIGNATURE ORDERING REQUIREMENTS
+-----------------------------------
+Status: CONSISTENT across all implementations.
+
+All implementations require strictly increasing guardian indices (see item b).
+This means signatures must be ordered by guardian index in ascending order.
+This is enforced on-chain and clients must sort before submission.
+
+VERDICT: No vulnerability.
+
+g) EMPTY/ZERO SIGNATURES
+-------------------------
+Status: PROPERLY HANDLED in all implementations.
+
+  - EVM: Empty guardian set rejected (line 75). Empty signatures fail quorum
+         check (line 90). ecrecover returning address(0) is explicitly rejected
+         (line 119).
+  - Go: Empty signatures/addresses return false (structs.go line 576-577).
+  - Aptos: quorum(0) = 1, so 0 signatures would fail the quorum check.
+  - Sui: quorum(0) = 1, same as Aptos. Also, Guardian::new rejects zero
+         addresses (guardian.move line 23).
+  - SVM shim: quorum check would catch empty signatures.
+  - Near/CosmWasm: quorum check catches empty signatures.
+
+VERDICT: No vulnerability.
+
+h) GUARDIAN SET UPGRADE RACE CONDITIONS
+----------------------------------------
+Status: ANALYZED. No critical issues found.
+
+EVM allows both the current and previous (non-expired) guardian sets to verify
+VAAs. This is by design to handle the transition period during upgrades. The
+expiration time is set when a new guardian set is registered, giving a grace
+period for in-flight VAAs.
+
+Governance actions (like guardian set upgrades) require the LATEST guardian set
+on Aptos (vaa.move line 211: assert_governance checks latest index).
+Similar checks exist on other chains.
+
+VERDICT: No vulnerability. Transition handling is well-designed.
+
+========================================================================
+CROSS-CHAIN CONSISTENCY ANALYSIS:
+========================================================================
+
+All implementations verify VAAs using the same fundamental approach:
+1. Parse VAA (version check, signatures, body)
+2. Compute double-keccak256 hash of body
+3. Check guardian set validity (exists, not expired)
+4. Check quorum (>= 2/3 + 1 of guardians)
+5. For each signature: recover address via ecrecover, compare to guardian key
+6. Enforce strictly increasing guardian indices
+
+KEY CONSISTENCY FINDINGS:
+- Hash computation: IDENTICAL across all chains (double keccak256)
+- Quorum formula: EQUIVALENT across all chains (verified mathematically)
+- Index ordering: All require strictly increasing (no duplicates)
+- Guardian address comparison: All use 20-byte Ethereum-style addresses
+
+NO CROSS-CHAIN DISCREPANCY FOUND that would allow a VAA to be accepted
+on one chain but rejected on another (for the same guardian set state).
+
+========================================================================
+DETAILED FINDINGS:
+========================================================================
+
+FINDING: No signature malleability check on EVM ecrecover
+FILE: ethereum/contracts/Messages.sol (line 116)
+CHAIN: EVM
+SEVERITY: Informational
+IN SCOPE: YES
+DETAILS: The EVM implementation uses raw ecrecover without rejecting
+high-s values (s > secp256k1n/2). While this allows transaction
+malleability, it does NOT affect the security of VAA verification because
+ecrecover returns the same address regardless of which s value is used.
+The VAA hash used for replay protection is computed from the message body,
+not from the signature. This is a known and accepted design choice.
+OpenZeppelin's ECDSA library rejects high-s values, but Wormhole
+intentionally uses raw ecrecover. No practical exploit exists.
+
+FINDING: Solana old bridge uses boolean accumulator instead of index ordering for signatures
+FILE: solana/bridge/program/src/api/verify_signature.rs (line 214)
+CHAIN: Solana (old bridge)
+SEVERITY: Informational
+IN SCOPE: YES
+DETAILS: The old Solana bridge implementation uses a boolean array
+(signature_set.signatures) where each position represents a guardian index.
+Setting a position to 'true' means that guardian's signature was verified.
+The quorum check in post_vaa.rs counts true values. This approach inherently
+prevents duplicates (setting the same index to true twice is idempotent).
+However, it differs architecturally from all other implementations which
+enforce strictly increasing indices. This is not a vulnerability but a
+design difference. The new SVM shim (svm/wormhole-core-shims) uses the
+standard strictly-increasing approach.
+
+FINDING: CosmWasm allows quorum of 0 for empty guardian sets
+FILE: cosmwasm/contracts/wormhole/src/state.rs (line 216)
+CHAIN: CosmWasm
+SEVERITY: Informational
+IN SCOPE: YES
+DETAILS: The CosmWasm quorum function returns 0 when the guardian set has
+no addresses. The comment says "allow quorum of 0 for testing purposes".
+While this could theoretically allow a VAA with 0 signatures to pass if an
+empty guardian set existed, this scenario is impossible in production because:
+(1) The initial guardian set is non-empty, (2) Guardian set upgrades require
+a governance VAA signed by the current (non-empty) set, (3) The upgrade
+process validates the new guardian set. The Terra implementation has the
+same pattern. This is testing-only code that cannot be triggered in production.
+
+FINDING: VAA version not included in signed hash
+FILE: ethereum/contracts/Messages.sol (lines 152-157)
+CHAIN: ALL
+SEVERITY: Informational
+IN SCOPE: YES
+DETAILS: The VAA version byte is NOT part of the hash that guardians sign.
+The code explicitly documents this at line 152: "Note that currently the
+VM.version is not part of the hash and for reasons described below it
+cannot be made part of the hash." Currently only version 1 is accepted
+(enforced by require statements), so this is not exploitable. However, if
+a version 2 were introduced with a different body format, the same guardian
+signatures could potentially be valid for both versions, depending on how
+parsing changes. This is acknowledged technical debt, not an active
+vulnerability.
+
+========================================================================
+SUMMARY:
+========================================================================
+
+After thorough audit of VAA signature verification across 7+ chain
+implementations (EVM, Solana old bridge, SVM shim, Aptos, Sui, Near,
+CosmWasm) and the Go guardian SDK:
+
+CRITICAL vulnerabilities found: 0
+HIGH vulnerabilities found: 0
+MEDIUM vulnerabilities found: 0
+LOW vulnerabilities found: 0
+INFORMATIONAL findings: 4
+
+The VAA signature verification is well-implemented and consistent across
+all chains. The core cryptographic verification (ecrecover + guardian key
+comparison + strictly increasing indices + quorum check) is sound. No
+cross-chain discrepancies were found that could lead to exploitable
+behavior.
+
+The codebase shows evidence of careful security engineering:
+- Explicit bounds checks on guardian indices
+- Empty guardian set protection
+- Guardian set expiry handling
+- Double-keccak256 for hash domain separation from raw signatures
+- Comprehensive test suites for edge cases (double signing, expired sets, etc.)
+
+No findings warrant a bug bounty submission at this time.

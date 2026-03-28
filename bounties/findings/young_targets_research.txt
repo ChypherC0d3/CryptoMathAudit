@@ -1,0 +1,263 @@
+================================================================================
+YOUNG TARGETS WITH CUSTOM CRYPTO - BUG BOUNTY RESEARCH
+Generated: 2026-03-28
+================================================================================
+
+METHODOLOGY:
+- Searched Immunefi for programs launched 2025-2026
+- Filtered for custom cryptographic implementations (ZK provers, threshold
+  signatures, custom field arithmetic, Rust crypto libraries)
+- Verified scope on Immunefi for each target
+- Ranked by: (bounty_amount * crypto_complexity * youth_factor) / (num_audits * competition)
+
+GUIDE_BEFORE_SUBMIT.md RULES APPLIED:
+- Scope URLs verified on immunefi.com/bug-bounty/[program]/scope/
+- Only programs with confirmed Immunefi listings included
+- In-scope assets noted for each target
+
+================================================================================
+TARGET #1: ZKsync OS / Airbender (PRIORITY 1)
+================================================================================
+
+TARGET: ZKsync OS (Airbender Proof System)
+URL: https://immunefi.com/bug-bounty/zksync-os/information/
+SCOPE URL: https://immunefi.com/bug-bounty/zksync-os/scope/
+LAUNCHED: November 24, 2025 (4 months old)
+MAX BOUNTY: $100,000 (10% of funds at risk, min $30,000)
+AUDITS: Audits listed at docs.zksync.io/zksync-protocol/security/audits
+        (new system so audit coverage likely incomplete)
+CUSTOM CRYPTO:
+  - Airbender: custom STARK/FRI proof system for RISC-V bytecode
+  - Custom circuit implementations and constraint systems
+  - Field operations and cryptographic extensions
+  - Machine operation circuits, delegation circuits
+  - Prover and verifier components (all custom-built)
+LANGUAGE: Rust
+OUR EDGE:
+  - VERY new proof system (4 months since bounty launch)
+  - 84 in-scope assets = massive attack surface
+  - Custom STARK/FRI = non-standard crypto, likely bugs in constraint systems
+  - Team intentionally planted a Medium-severity bug to attract researchers
+    (indicates they expect more bugs exist)
+  - RISC-V bytecode proving is cutting-edge, few researchers have expertise
+  - Circuit constraint bugs are notoriously hard to find and high-impact
+SCOPE VERIFIED: YES - 84 assets covering Airbender prover/verifier,
+  ZKsync OS execution layer, EVM interpreter, storage models, system hooks.
+  Primacy of Impact applies.
+PRIORITY: 1 - Newest custom ZK prover, Rust, massive scope, high complexity,
+  planted bug confirms more exist. Best risk/reward ratio.
+
+================================================================================
+TARGET #2: monero-oxide (PRIORITY 2)
+================================================================================
+
+TARGET: monero-oxide
+URL: https://immunefi.com/bug-bounty/monero-oxide/information/
+SCOPE URL: https://immunefi.com/bug-bounty/monero-oxide/scope/
+LAUNCHED: September 9, 2025 (6 months old)
+MAX BOUNTY: $100,000 (Critical), $10,000 (High), $1,000 (Low)
+AUDITS: 1 audit by Cypher Stack (August 14, 2025)
+        Very few audits for a crypto library = high bug probability
+CUSTOM CRYPTO:
+  - Full Rust reimplementation of Monero protocol primitives
+  - Ring signatures (custom implementation)
+  - Pedersen commitments
+  - Bulletproofs (range proofs)
+  - Key derivation and stealth addresses
+  - Transaction construction and verification
+LANGUAGE: Rust
+OUR EDGE:
+  - Pure crypto library = every function is a potential crypto bug
+  - Only 1 audit on the entire codebase
+  - Monero's crypto is complex (ring signatures, bulletproofs)
+  - Rust reimplementation of existing C++ code = translation bugs likely
+  - Less researcher competition (Monero niche vs mainstream DeFi)
+  - Related to Serai DEX (cross-submission possible)
+  - Edge cases in field arithmetic, group operations, scalar handling
+SCOPE VERIFIED: YES - Main repo https://github.com/monero-oxide/monero-oxide/tree/main
+  is in scope. Primacy of Impact applies.
+PRIORITY: 2 - Pure Rust crypto library with only 1 audit. Ring signatures
+  and bulletproofs are complex enough that reimplementation bugs are likely.
+  $100K for a critical is strong for a focused crypto-only target.
+
+================================================================================
+TARGET #3: zkVerify (PRIORITY 3)
+================================================================================
+
+TARGET: zkVerify
+URL: https://immunefi.com/bug-bounty/zkverify/
+SCOPE URL: https://immunefi.com/bug-bounty/zkverify/scope/
+LAUNCHED: September 5, 2025 (7 months old)
+MAX BOUNTY: $50,000 (5% of funds at risk, min $15,000)
+AUDITS: 2 - Trail of Bits (Feb 2025), SRLabs (Sep 2025)
+CUSTOM CRYPTO:
+  - Modular ZK proof verification infrastructure
+  - Supports multiple proof systems (verifier implementations)
+  - Custom verification logic for offloading proof verification
+  - Substrate-based blockchain with custom pallets
+LANGUAGE: Rust
+OUR EDGE:
+  - Verification of multiple proof systems = large crypto surface area
+  - Still young (7 months), verification logic is where bugs hide
+  - Modular architecture means integration bugs between proof types
+  - "Everything is in scope except Hyperbridge" = broad scope
+  - Trail of Bits audit is good but doesn't catch everything,
+    especially in newly added proof system support
+SCOPE VERIFIED: YES - zkVerify GitHub repo (blockchain/DLT), zkVerifyjs repo,
+  zkverify.io website all in scope. Primacy of Impact applies.
+PRIORITY: 3 - Good crypto complexity in proof verification, but lower bounty
+  ($50K max) reduces attractiveness. 2 audits provide some coverage.
+
+================================================================================
+TARGET #4: INTMAX (PRIORITY 4)
+================================================================================
+
+TARGET: INTMAX
+URL: https://immunefi.com/bug-bounty/intmax/information/
+SCOPE URL: https://immunefi.com/bug-bounty/intmax/scope/
+LAUNCHED: May 27, 2025 (10 months old)
+MAX BOUNTY: $10,000 (Critical), $5,000 (other Critical)
+AUDITS: Not prominently listed (likely few for this new protocol)
+CUSTOM CRYPTO:
+  - Stateless zkRollup combining Plasma + ZKPs
+  - Custom plonky2_keccak library (ZKP for Keccak256)
+  - Custom plonky2_bn254 library (ZKP for BN254 curve arithmetic)
+  - intmax2-zkp module (zero-knowledge proof system)
+  - Novel stateless architecture distributing computation to user devices
+LANGUAGE: Rust (node, ZKP libs), Solidity (contracts)
+OUR EDGE:
+  - Custom plonky2 extensions for keccak and BN254 = niche crypto
+  - Stateless ZK rollup is novel architecture, few have audited this pattern
+  - 11 in-scope repos including core ZKP libraries
+  - plonky2 extensions are where constraint bugs live
+  - Less researcher competition due to niche architecture
+SCOPE VERIFIED: YES - 11 repos in scope including intmax2-zkp, plonky2_keccak,
+  plonky2_bn254, intmax2-contract, node code. Primacy of Impact applies.
+PRIORITY: 4 - Excellent custom crypto (plonky2 extensions), but LOW bounty
+  ($10K max critical) makes it less worthwhile per hour invested.
+  Good for learning/building reputation if a finding is made.
+
+================================================================================
+TARGET #5: Serai DEX (PRIORITY 5)
+================================================================================
+
+TARGET: Serai DEX
+URL: https://immunefi.com/bug-bounty/serai/information/
+SCOPE URL: https://immunefi.com/bug-bounty/serai/scope/
+LAUNCHED: August 4, 2023 (2.5 years old - older but still relevant)
+MAX BOUNTY: $30,000 (Critical)
+AUDITS: 1 - Cypher Stack Crypto (March 2023)
+CUSTOM CRYPTO:
+  - modular-frost: Custom FROST threshold signature implementation
+  - schnorr-signatures: Custom Schnorr signature library
+  - schnorrkel: Ristretto-based Schnorr signatures (sr25519)
+  - dkg: Distributed Key Generation protocol
+  - dkg-musig: MuSig DKG implementation
+  - ciphersuite: Cryptographic ciphersuite definitions
+  - multiexp: Multi-exponentiation optimizations
+  - dalek-ff-group: Custom finite field / group abstractions
+  - flexible-transcript: Transcript protocol for Fiat-Shamir
+  - bitcoin-serai: Bitcoin integration with threshold sigs
+LANGUAGE: Rust
+OUR EDGE:
+  - THE most crypto-dense target on this list
+  - 11 repos ALL focused on cryptographic primitives
+  - Custom FROST, Schnorr, DKG, MuSig = threshold crypto gold mine
+  - Only 1 audit (2023, likely outdated given code changes)
+  - In-scope impacts include "signing of unintended messages",
+    "ability to forge proofs", "recovery of private spend keys"
+  - dalek-ff-group = custom field arithmetic = classic bug class
+  - Shares codebase with monero-oxide (cross-pollination possible)
+SCOPE VERIFIED: YES - 11 repos: ciphersuite, dkg, modular-frost,
+  schnorr-signatures, schnorrkel, multiexp, dalek-ff-group,
+  flexible-transcript, dkg-musig, bitcoin-serai. Primacy of Impact applies.
+PRIORITY: 5 - Extremely crypto-dense but older (2.5 years) and lower bounty
+  ($30K). However, if you find a bug in FROST/DKG/Schnorr, the same
+  patterns may apply to monero-oxide for a separate $100K bounty.
+
+================================================================================
+HONORABLE MENTIONS (verified on Immunefi but lower priority)
+================================================================================
+
+TARGET: Scroll
+URL: https://immunefi.com/bug-bounty/scroll/
+LAUNCHED: October 17, 2023 (2.5 years)
+MAX BOUNTY: $1,000,000
+AUDITS: Multiple (Trail of Bits, OpenZeppelin, Euclid upgrades 2025)
+CUSTOM CRYPTO: ZK rollup with custom circuits (Go-based l2geth)
+LANGUAGE: Go, Solidity
+WHY LOWER PRIORITY: Higher bounty but heavily audited, more researcher
+competition, older program. Still worth monitoring for new scope additions.
+SCOPE VERIFIED: YES - 36 assets in scope.
+
+TARGET: Linea
+URL: https://immunefi.com/bug-bounty/linea/
+LAUNCHED: July 11, 2023 (2.5 years)
+MAX BOUNTY: $100,000
+AUDITS: 17 audits (Consensys Diligence, OpenZeppelin, Cyfrin)
+CUSTOM CRYPTO: Type 2 zkEVM (but mostly Solidity contracts in scope)
+LANGUAGE: Solidity
+WHY LOWER PRIORITY: 17 audits = very well-covered. Smart contract scope
+only (not the prover). Lower probability of finding new bugs.
+SCOPE VERIFIED: YES - L1/L2 tokens, bridges, rollup contracts.
+
+TARGET: Threshold Network (tBTC)
+URL: https://immunefi.com/bug-bounty/thresholdnetwork/
+LAUNCHED: April 28, 2023 (3 years)
+MAX BOUNTY: $150,000
+AUDITS: 7 audits (latest: Thesis Defense Nov 2025)
+CUSTOM CRYPTO: Threshold ECDSA for Bitcoin bridge, but mostly JS/Solidity
+LANGUAGE: JavaScript, Solidity
+WHY LOWER PRIORITY: Older program, 7 audits, threshold crypto is in
+off-chain components that may not be in bounty scope.
+SCOPE VERIFIED: YES - 52 assets across multiple chains.
+
+================================================================================
+RECOMMENDED ATTACK STRATEGY (in order)
+================================================================================
+
+1. ZKsync OS / Airbender (Priority 1):
+   - Focus on STARK constraint system soundness
+   - Look for missing constraints in machine operation circuits
+   - Check field arithmetic edge cases in Rust implementations
+   - Review delegation circuit interactions for completeness
+   - Start with the intentionally planted Medium bug to learn codebase
+
+2. monero-oxide (Priority 2):
+   - Focus on ring signature construction/verification
+   - Check bulletproof range proof edge cases
+   - Compare Rust implementation against reference C++ for divergences
+   - Look for scalar/point validation gaps
+   - Test key derivation corner cases
+
+3. zkVerify (Priority 3):
+   - Focus on proof verification logic for each supported proof system
+   - Check cross-proof-system interactions in the modular architecture
+   - Review Substrate pallet custom logic
+
+4. INTMAX (Priority 4):
+   - Focus on plonky2_keccak and plonky2_bn254 constraint systems
+   - Check stateless rollup state transition validity
+   - Low bounty but high learning value
+
+5. Serai (Priority 5):
+   - Focus on FROST/DKG implementation correctness
+   - Check multiexp optimizations for edge cases
+   - Findings may cross-apply to monero-oxide
+
+================================================================================
+SCOPE VERIFICATION REMINDER (per GUIDE_BEFORE_SUBMIT.md)
+================================================================================
+
+Before submitting ANY report:
+1. Download CURRENT scope from immunefi.com/bug-bounty/[program]/scope/
+2. Save to F:\Claude\BugBounty\bounties\[program]\scope_assets.txt
+3. Verify EXACT contract/repo is listed in scope
+4. Verify impact type is in "Impacts in Scope"
+5. Check known issues and prior audit reports
+6. Prepare complete, executable PoC
+7. Final check against GUIDE_BEFORE_SUBMIT.md checklist
+
+================================================================================
+END OF RESEARCH
+================================================================================
