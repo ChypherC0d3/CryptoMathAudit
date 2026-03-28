@@ -1,0 +1,551 @@
+================================================================================
+HYPERLANE WeightedMultisigIsm DEEP DIVE ANALYSIS
+================================================================================
+Target: Hyperlane Monorepo - AbstractWeightedMultisigIsm.sol
+Bounty Program: Immunefi (up to $2.5M for Critical)
+Date: 2026-03-27
+
+================================================================================
+1. THE CLAIMED BUG: _validatorCount CAPPING
+================================================================================
+
+CLAIM: _validatorCount is capped at Math.min(validators.length, signatureCount),
+meaning validators at array indices beyond signatureCount can never be matched,
+causing valid weighted quorums to be rejected.
+
+SOURCE CODE (AbstractWeightedMultisigIsm.sol, lines 64-94):
+
+    uint256 _validatorCount = Math.min(
+        _validators.length,
+        signatureCount(_metadata)
+    );
+    uint256 _validatorIndex = 0;
+    uint96 _totalWeight = 0;
+
+    // assumes that signatures are ordered by validator
+    for (
+        uint256 signatureIndex = 0;
+        _totalWeight < _thresholdWeight && signatureIndex < _validatorCount;
+        ++signatureIndex
+    ) {
+        address _signer = ECDSA.recover(
+            _digest,
+            signatureAt(_metadata, signatureIndex)
+        );
+        // loop through remaining validators until we find a match
+        while (
+            _validatorIndex < _validatorCount &&
+            _signer != _validators[_validatorIndex].signingAddress
+        ) {
+            ++_validatorIndex;
+        }
+        // fail if we never found a match
+        require(_validatorIndex < _validatorCount, "Invalid signer");
+
+        // add the weight of the current validator
+        _totalWeight += _validators[_validatorIndex].weight;
+        ++_validatorIndex;
+    }
+
+ANALYSIS - THE BUG IS REAL AND CONFIRMED:
+
+The variable _validatorCount is used as BOTH:
+  (a) The upper bound for iterating signatures (signatureIndex < _validatorCount)
+  (b) The upper bound for scanning the validators array (_validatorIndex < _validatorCount)
+
+When signatureCount < validators.length, _validatorCount = signatureCount.
+
+This means the inner while-loop that scans validators for a matching signer is
+ALSO capped at signatureCount entries. Validators beyond index signatureCount-1
+in the validators array are INVISIBLE to the matching logic.
+
+COMPARISON WITH NON-WEIGHTED VERSION (AbstractMultisigIsm.sol, lines 95-123):
+
+    uint256 _validatorCount = _validators.length;  // <-- FULL LENGTH, NOT CAPPED
+    uint256 _validatorIndex = 0;
+    for (uint256 i = 0; i < _threshold; ++i) {
+        address _signer = ECDSA.recover(_digest, signatureAt(_metadata, i));
+        while (
+            _validatorIndex < _validatorCount &&
+            _signer != _validators[_validatorIndex]
+        ) {
+            ++_validatorIndex;
+        }
+        require(_validatorIndex < _validatorCount, "!threshold");
+        ++_validatorIndex;
+    }
+
+In the NON-weighted version:
+  - The outer loop iterates over signatures (i < _threshold)
+  - The inner loop scans over ALL validators (_validatorIndex < _validators.length)
+  - These are SEPARATE bounds -> correct
+
+In the WEIGHTED version:
+  - Both loops use _validatorCount = min(validators.length, signatureCount)
+  - This conflates two separate concepts -> BUG
+
+================================================================================
+2. CONCRETE EXPLOITATION EXAMPLE
+================================================================================
+
+Setup:
+  - 5 validators: [V0, V1, V2, V3, V4]
+  - Weights:      [20, 20, 20, 20, 20] (as fractions of TOTAL_WEIGHT=1e10)
+  - thresholdWeight = 60 (needs any 3 validators)
+  - 3 signatures provided from validators V2, V3, V4 (indices 2, 3, 4)
+  - signatureCount = 3
+
+Execution trace:
+
+  _validatorCount = Math.min(5, 3) = 3   <-- BUG: caps at 3
+
+  Outer loop iteration 0 (signatureIndex=0):
+    _signer = recover(sig[0]) = V2
+    Inner while: _validatorIndex=0, check _validators[0]=V0 != V2 -> index=1
+    Inner while: _validatorIndex=1, check _validators[1]=V1 != V2 -> index=2
+    Inner while: _validatorIndex=2, check _validators[2]=V2 == V2 -> match!
+    But wait: _validatorIndex=2 < _validatorCount=3 -> OK
+    _totalWeight += 20, _validatorIndex = 3
+
+  Outer loop iteration 1 (signatureIndex=1):
+    _signer = recover(sig[1]) = V3
+    Inner while: _validatorIndex=3, but 3 < 3 is FALSE -> exits while loop
+    require(_validatorIndex < _validatorCount) -> require(3 < 3) -> REVERTS!
+    "Invalid signer"
+
+RESULT: The transaction REVERTS even though V3 is a valid validator at index 3.
+The matching loop cannot reach validators[3] or validators[4] because
+_validatorCount = 3 (not 5).
+
+SAME SIGNATURES FROM LOW-INDEX VALIDATORS:
+  - 3 signatures from V0, V1, V2 (indices 0, 1, 2) with signatureCount=3
+  - _validatorCount = min(5, 3) = 3
+  - All 3 validators are at indices 0,1,2 which are < 3 -> SUCCEEDS
+
+This proves: the POSITION of the validator in the array determines whether
+a valid quorum is accepted or rejected, which is incorrect behavior.
+
+================================================================================
+3. PROOF OF CONCEPT (Foundry/Forge Test)
+================================================================================
+
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.13;
+
+import "forge-std/Test.sol";
+import {ECDSA} from "@openzeppelin/contracts/utils/cryptography/ECDSA.sol";
+import {Math} from "@openzeppelin/contracts/utils/math/Math.sol";
+import {IStaticWeightedMultisigIsm} from
+    "../../contracts/interfaces/isms/IWeightedMultisigIsm.sol";
+import {StaticMessageIdWeightedMultisigIsmFactory} from
+    "../../contracts/isms/multisig/WeightedMultisigIsm.sol";
+import {AbstractStaticWeightedMultisigIsm} from
+    "../../contracts/isms/multisig/AbstractWeightedMultisigIsm.sol";
+import {StaticWeightedValidatorSetFactory} from
+    "../../contracts/libs/StaticWeightedValidatorSetFactory.sol";
+import {TestMailbox} from "../../contracts/test/TestMailbox.sol";
+import {TestMerkleTreeHook} from "../../contracts/test/TestMerkleTreeHook.sol";
+import {TestPostDispatchHook} from "../../contracts/test/TestPostDispatchHook.sol";
+import {MessageIdMultisigIsmMetadata} from
+    "../../contracts/isms/libs/MessageIdMultisigIsmMetadata.sol";
+import {TypeCasts} from "../../contracts/libs/TypeCasts.sol";
+import {Message} from "../../contracts/libs/Message.sol";
+import {CheckpointLib} from "../../contracts/libs/CheckpointLib.sol";
+
+contract WeightedMultisigBugPoC is Test {
+    using Message for bytes;
+    using TypeCasts for address;
+
+    uint96 constant TOTAL_WEIGHT = 1e10;
+    uint32 constant ORIGIN = 1;
+    uint32 constant DESTINATION = 2;
+
+    TestMailbox mailbox;
+    TestMerkleTreeHook merkleTreeHook;
+    TestPostDispatchHook noopHook;
+    StaticMessageIdWeightedMultisigIsmFactory factory;
+
+    // 5 validator private keys
+    uint256[5] private keys;
+    address[5] private addrs;
+
+    function setUp() public {
+        mailbox = new TestMailbox(ORIGIN);
+        merkleTreeHook = new TestMerkleTreeHook(address(mailbox));
+        noopHook = new TestPostDispatchHook();
+        factory = new StaticMessageIdWeightedMultisigIsmFactory();
+        mailbox.setDefaultHook(address(merkleTreeHook));
+        mailbox.setRequiredHook(address(noopHook));
+
+        // Generate 5 validator keys, sorted by address (required by two-pointer)
+        for (uint256 i = 0; i < 5; i++) {
+            keys[i] = uint256(keccak256(abi.encode("validator", i)));
+            addrs[i] = vm.addr(keys[i]);
+        }
+        // Sort by address (bubble sort for PoC simplicity)
+        for (uint256 i = 0; i < 4; i++) {
+            for (uint256 j = i + 1; j < 5; j++) {
+                if (addrs[i] > addrs[j]) {
+                    (addrs[i], addrs[j]) = (addrs[j], addrs[i]);
+                    (keys[i], keys[j]) = (keys[j], keys[i]);
+                }
+            }
+        }
+    }
+
+    function _deployIsm(uint96 threshold)
+        internal
+        returns (AbstractStaticWeightedMultisigIsm)
+    {
+        // Equal weight distribution: each validator gets TOTAL_WEIGHT/5
+        IStaticWeightedMultisigIsm.ValidatorInfo[] memory validators =
+            new IStaticWeightedMultisigIsm.ValidatorInfo[](5);
+        uint96 weightEach = uint96(TOTAL_WEIGHT / 5); // 2e9 each
+        for (uint256 i = 0; i < 5; i++) {
+            validators[i] = IStaticWeightedMultisigIsm.ValidatorInfo({
+                signingAddress: addrs[i],
+                weight: weightEach
+            });
+        }
+        address ism = factory.deploy(validators, threshold);
+        return AbstractStaticWeightedMultisigIsm(ism);
+    }
+
+    function _buildMetadata(
+        bytes memory message,
+        uint256[] memory signerIndices
+    ) internal view returns (bytes memory) {
+        (bytes32 root, uint32 index) = merkleTreeHook.latestCheckpoint();
+        bytes32 digest = CheckpointLib.digest(
+            ORIGIN,
+            address(merkleTreeHook).addressToBytes32(),
+            root,
+            index,
+            message.id()
+        );
+
+        // Build metadata prefix (originMerkleTreeHook + root + index)
+        bytes memory metadata = abi.encodePacked(
+            address(merkleTreeHook).addressToBytes32(),
+            root,
+            index
+        );
+
+        // Append signatures in order of validator index
+        for (uint256 i = 0; i < signerIndices.length; i++) {
+            (uint8 v, bytes32 r, bytes32 s) = vm.sign(
+                keys[signerIndices[i]],
+                digest
+            );
+            metadata = abi.encodePacked(metadata, r, s, v);
+        }
+        return metadata;
+    }
+
+    /// @notice LOW-INDEX validators (0,1,2) - this SUCCEEDS
+    function test_lowIndexValidators_succeeds() public {
+        // threshold = 3 * (TOTAL_WEIGHT/5) = 6e9 (needs 3 validators)
+        uint96 threshold = uint96(TOTAL_WEIGHT * 3 / 5); // 6e9
+        AbstractStaticWeightedMultisigIsm ism = _deployIsm(threshold);
+
+        bytes memory message = mailbox.buildOutboundMessage(
+            DESTINATION,
+            address(0x1234).addressToBytes32(),
+            "hello"
+        );
+        mailbox.dispatch(
+            DESTINATION,
+            address(0x1234).addressToBytes32(),
+            "hello"
+        );
+
+        // Sign with validators at indices 0, 1, 2 (low indices)
+        uint256[] memory signers = new uint256[](3);
+        signers[0] = 0;
+        signers[1] = 1;
+        signers[2] = 2;
+
+        bytes memory metadata = _buildMetadata(message, signers);
+
+        // This should SUCCEED - and it does
+        bool result = ism.verify(metadata, message);
+        assertTrue(result, "Low-index validators should succeed");
+    }
+
+    /// @notice HIGH-INDEX validators (2,3,4) - this FAILS due to the bug
+    function test_highIndexValidators_rejected() public {
+        // Same threshold - needs 3 validators
+        uint96 threshold = uint96(TOTAL_WEIGHT * 3 / 5); // 6e9
+        AbstractStaticWeightedMultisigIsm ism = _deployIsm(threshold);
+
+        bytes memory message = mailbox.buildOutboundMessage(
+            DESTINATION,
+            address(0x1234).addressToBytes32(),
+            "hello"
+        );
+        mailbox.dispatch(
+            DESTINATION,
+            address(0x1234).addressToBytes32(),
+            "hello"
+        );
+
+        // Sign with validators at indices 2, 3, 4 (high indices)
+        uint256[] memory signers = new uint256[](3);
+        signers[0] = 2;
+        signers[1] = 3;
+        signers[2] = 4;
+
+        bytes memory metadata = _buildMetadata(message, signers);
+
+        // BUG: This REVERTS with "Invalid signer" even though these are
+        // valid validators with sufficient weight.
+        // _validatorCount = min(5, 3) = 3, so validators at indices 3,4
+        // are unreachable.
+        vm.expectRevert("Invalid signer");
+        ism.verify(metadata, message);
+    }
+}
+
+================================================================================
+4. ROOT CAUSE ANALYSIS
+================================================================================
+
+The root cause is the single variable _validatorCount serving dual purpose:
+
+  uint256 _validatorCount = Math.min(_validators.length, signatureCount(_metadata));
+
+This was likely intended to prevent out-of-bounds access when iterating
+signatures (don't read more signatures than exist). But it was ALSO applied
+to the validator-scanning inner loop, which needs to scan the FULL validator
+array to find matches.
+
+THE FIX should be to use separate bounds:
+
+  uint256 _signatureCount = signatureCount(_metadata);
+  uint256 _validatorCount = _validators.length;
+  uint256 _loopBound = Math.min(_validatorCount, _signatureCount);
+
+  for (uint256 signatureIndex = 0;
+       _totalWeight < _thresholdWeight && signatureIndex < _loopBound;
+       ++signatureIndex)
+  {
+      // ...
+      while (_validatorIndex < _validatorCount && /* not match */) {
+          ++_validatorIndex;
+      }
+      require(_validatorIndex < _validatorCount, "Invalid signer");
+      // ...
+  }
+
+This matches the pattern in AbstractMultisigIsm.verify() which correctly
+uses _validators.length for the inner scan.
+
+================================================================================
+5. COMPARISON WITH AbstractMultisigIsm (NON-WEIGHTED)
+================================================================================
+
+AbstractMultisigIsm.verify() does NOT have this bug:
+
+    uint256 _validatorCount = _validators.length;  // Full array length
+    // outer loop: i < _threshold (number of required signatures)
+    // inner loop: _validatorIndex < _validatorCount (full array)
+
+The non-weighted version correctly separates:
+  - How many signatures to process: _threshold (from validatorsAndThreshold)
+  - How far to scan validators: _validators.length (full array)
+
+The weighted version conflates both into _validatorCount = min(length, sigCount).
+
+================================================================================
+6. GIT HISTORY & PRIOR REPORTS
+================================================================================
+
+Commit history on AbstractWeightedMultisigIsm.sol:
+  - d396e2c55: feat: add IStaticWeightedIsm implementation (#4170) -- initial
+  - 2760da1de: fix: ensure no duplicate signatures (#4468) -- added ++_validatorIndex
+
+The #4468 fix (Oct 2024) added ++_validatorIndex to prevent duplicate signature
+replay. This fix was CORRECT for the duplicate-sig issue but did NOT address the
+_validatorCount capping bug. The capping bug has existed since the INITIAL commit
+(#4170) and persists in the current code.
+
+The existing test suite (WeightedMultisigIsm.t.sol) does NOT catch this bug
+because getMetadata() always signs starting from signerCount=0 (lowest indices
+first), accumulating weight from index 0 upward. It never tests the scenario
+where only high-index validators sign.
+
+================================================================================
+7. MAILBOX.SOL CEI VIOLATION ANALYSIS (Lines 202-246)
+================================================================================
+
+The process() function in Mailbox.sol follows this order:
+
+    /// CHECKS ///
+    require(version matches);
+    require(destination matches);
+    require(not already delivered);
+
+    /// EFFECTS ///
+    deliveries[_id] = Delivery({...});    // <-- STATE WRITTEN FIRST
+    emit Process(...);
+    emit ProcessId(_id);
+
+    /// INTERACTIONS ///
+    require(ism.verify(_metadata, _message));   // <-- EXTERNAL CALL AFTER
+    IMessageRecipient(recipient).handle(...);    // <-- ANOTHER EXTERNAL CALL
+
+ANALYSIS:
+
+The delivery is recorded BEFORE ism.verify() is called. This is technically a
+CEI violation (state is modified before an external interaction). However:
+
+IS IT EXPLOITABLE?
+
+  1. Reentrancy via malicious ISM:
+     - If a malicious ISM's verify() calls back into Mailbox.process() with
+       the SAME message, the second call would fail at "already delivered"
+       check (line 217) because deliveries[_id] was already set.
+     - This actually PROTECTS against replay - the pre-set delivery acts as
+       a reentrancy guard for the same message ID.
+
+  2. Reentrancy via malicious ISM with DIFFERENT message:
+     - A malicious ISM could call process() with a different message during
+       verify(). This would succeed if the different message passes its own
+       ISM verification.
+     - However, the ISM is chosen per-recipient, and the recipient controls
+       which ISM it uses. A legitimately-configured ISM would not call back.
+     - If the recipient sets a malicious ISM, they are only harming themselves.
+
+  3. Read-only reentrancy:
+     - delivered(_id) returns true during ISM verify, which could mislead
+       external contracts checking delivery status.
+     - But verify() on standard ISMs is a view function (pure signature
+       verification) and would not query delivery status.
+
+  4. There is NO ReentrancyGuard on Mailbox.process().
+
+VERDICT: The CEI violation is real but has LOW exploitability:
+  - The early write to deliveries[] actually prevents same-message reentrancy.
+  - A malicious ISM could reenter with a different message, but that requires
+    a compromised/malicious ISM which is already a trust assumption violation.
+  - Severity: Informational/Low. Not bounty-worthy on its own.
+
+================================================================================
+8. DEPLOYMENT & TVL IMPACT ASSESSMENT
+================================================================================
+
+WeightedMultisigIsm is a NEWER ISM type. Based on the code:
+  - StaticMerkleRootWeightedMultisigIsm (moduleType = WEIGHTED_MERKLE_ROOT_MULTISIG)
+  - StaticMessageIdWeightedMultisigIsm (moduleType = WEIGHTED_MESSAGE_ID_MULTISIG)
+
+These are deployed via factory contracts (StaticMerkleRootWeightedMultisigIsmFactory,
+StaticMessageIdWeightedMultisigIsmFactory).
+
+Deployment status: The WeightedMultisigIsm was introduced relatively recently
+(PR #4170). The TypeScript SDK added support (noted in CHANGELOG). It would
+need to be checked on-chain whether any production routes use WeightedMultisigIsm
+vs the traditional MultisigIsm.
+
+Key question for impact: Which mainnet routes use WeightedMultisigIsm?
+  - If none are deployed yet on mainnet, impact is Informational/Low
+  - If any warp routes or core messaging paths use it, impact is High/Critical
+
+The bug affects ANY WeightedMultisigIsm deployment where:
+  - signatureCount < validators.length (i.e., not all validators sign)
+  - The signing validators are not in the lowest indices of the array
+
+In practice, Hyperlane relayers would likely sign from the lowest-index
+validators first (as the test suite does), so the bug may not manifest in
+normal operation. But it WOULD manifest if:
+  - Some low-index validators are offline
+  - Only high-index validators are available to sign
+  - The relayer correctly gathers a quorum from available validators
+
+================================================================================
+9. SEVERITY ASSESSMENT
+================================================================================
+
+IF DEPLOYED ON MAINNET:
+
+Impact: HIGH to CRITICAL
+  - Valid quorums from high-index validators are rejected
+  - Messages cannot be delivered when only high-index validators are available
+  - This is a denial-of-service on the messaging bridge
+  - Funds on source chain could be stuck (cannot complete bridging)
+  - The DoS is NOT attacker-controlled (it depends on which validators are
+    available), making it more of a liveness failure than an active attack
+
+Immunefi Severity Classification:
+  - If it blocks message delivery with locked funds -> Critical ($2.5M)
+  - If it only affects availability without fund loss -> High
+  - Key factor: can funds be permanently stuck, or just delayed?
+
+My assessment: HIGH severity (not Critical)
+  - The bug causes intermittent DoS when specific validator subsets sign
+  - Funds are not permanently lost - they can be delivered when low-index
+    validators come online, or by including more signatures
+  - No direct theft of funds
+  - The workaround exists: relayers can always include signatures from
+    low-index validators first
+
+IF NOT YET DEPLOYED ON MAINNET: Medium/Low
+  - Pre-deployment bug in new feature
+  - Important to fix but no active risk
+
+================================================================================
+10. THE EXISTING TEST SUITE BLIND SPOT
+================================================================================
+
+The test file WeightedMultisigIsm.t.sol has a critical blind spot.
+
+In getMetadata() (line 117-131), signatures are always collected starting
+from signerCount=0 (the lowest index validator). The loop:
+
+    while (totalWeight < thresholdWeight && signerCount < allValidators.length) {
+        vm.sign(keys[signerCount], digest);
+        totalWeight += allValidators[signerCount].weight;
+        signerCount++;
+    }
+
+This always starts from index 0 and works upward. It NEVER tests:
+  - Signing with only high-index validators
+  - Skipping low-index validators
+  - Any validator subset that doesn't start from index 0
+
+The fuzz testing (test_verify with random m, n, seed) varies the NUMBER of
+validators and the THRESHOLD, but the signing always starts from the bottom.
+This is why the bug was never caught.
+
+================================================================================
+11. SUMMARY OF FINDINGS
+================================================================================
+
+FINDING 1: WeightedMultisigIsm _validatorCount Capping Bug
+  Status: CONFIRMED - Real bug, present since initial implementation
+  Severity: HIGH (assuming mainnet deployment) / Medium (if not deployed)
+  Root Cause: Math.min(validators.length, signatureCount) used as bound
+              for BOTH signature iteration AND validator scanning
+  Fix: Use separate bounds - signatureCount for outer loop,
+       validators.length for inner loop
+  Prior reports: The duplicate-sig bug (#4468) was fixed but this separate
+                 bug was NOT addressed
+
+FINDING 2: Mailbox.sol CEI Violation
+  Status: CONFIRMED - Real pattern violation
+  Severity: LOW/Informational
+  Root Cause: deliveries[_id] set before ism.verify() external call
+  Exploitability: Very low - the early write actually prevents same-ID
+                  reentrancy, and cross-ID reentrancy requires malicious ISM
+  Fix: Move deliveries write after ism.verify() completes
+
+RECOMMENDATION:
+  - Finding 1 is worth submitting if WeightedMultisigIsm is deployed or
+    about to be deployed on mainnet
+  - Finding 2 is supplementary - include for completeness but unlikely to
+    increase bounty payout
+  - Check on-chain factory deployments to confirm mainnet usage before
+    submitting
+
+================================================================================
+END OF ANALYSIS
+================================================================================

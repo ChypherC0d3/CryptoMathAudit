@@ -1,0 +1,758 @@
+================================================================================
+FIREDANCER ED25519 DEEP DIVE - CONSENSUS-SPLITTING BUG ANALYSIS
+================================================================================
+Date: 2026-03-27
+Target: Firedancer (https://github.com/firedancer-io/firedancer)
+Focus: Ed25519 signature verification - consensus split with Agave/Dalek
+Bounty: Up to $500K for consensus-splitting bugs
+
+================================================================================
+SECTION 1: COMPLETE FILE INVENTORY
+================================================================================
+
+CORE IMPLEMENTATION FILES:
+  src/ballet/ed25519/fd_ed25519.h                    -- Public Ed25519 API header
+  src/ballet/ed25519/fd_ed25519_user.c               -- Core: verify, sign, batch verify
+  src/ballet/ed25519/fd_curve25519.h                 -- Public Curve25519 API header (dispatch ref/avx512)
+  src/ballet/ed25519/fd_curve25519.c                 -- Curve25519 impl: scalar mul, frombytes, tobytes
+  src/ballet/ed25519/fd_curve25519_scalar.h          -- Scalar arithmetic: reduce, validate, muladd
+  src/ballet/ed25519/fd_curve25519_scalar.c          -- Scalar reduce/muladd implementation
+  src/ballet/ed25519/fd_curve25519_secure.c          -- Dispatch to ref/avx512 secure impls
+  src/ballet/ed25519/fd_curve25519_tables.c          -- Table generation (offline)
+  src/ballet/ed25519/fd_f25519.h                     -- Public field element API
+  src/ballet/ed25519/fd_f25519.c                     -- Field element impl: pow, inv, sqrt_ratio
+
+REFERENCE (PORTABLE) IMPLEMENTATION:
+  src/ballet/ed25519/ref/fd_curve25519.h             -- Point type, inline ops (ref)
+  src/ballet/ed25519/ref/fd_curve25519.c             -- Point add/sub/dbl/frombytes_2x (ref)
+  src/ballet/ed25519/ref/fd_curve25519_secure.c      -- Secure point add/dbl (ref)
+  src/ballet/ed25519/ref/fd_f25519.h                 -- Field element type and ops (ref, uses fiat-crypto)
+  src/ballet/ed25519/ref/fd_f25519.c                 -- Field element vectorized ops (ref)
+
+AVX512 OPTIMIZED IMPLEMENTATION:
+  src/ballet/ed25519/avx512/fd_curve25519.h          -- Point type using r43x6 representation
+  src/ballet/ed25519/avx512/fd_curve25519.c          -- Point add/sub/dbl (avx512)
+  src/ballet/ed25519/avx512/fd_curve25519_secure.c   -- Secure point ops (avx512)
+  src/ballet/ed25519/avx512/fd_f25519.h              -- Field element using r43x6
+  src/ballet/ed25519/avx512/fd_f25519.c              -- Field vectorized ops (avx512)
+
+PRECOMPUTED TABLES:
+  src/ballet/ed25519/table/fd_curve25519_table_ref.c
+  src/ballet/ed25519/table/fd_curve25519_table_avx512.c
+  src/ballet/ed25519/table/fd_f25519_table_ref.c
+  src/ballet/ed25519/table/fd_f25519_table_avx512.c
+
+FIAT-CRYPTO GENERATED CODE (field arithmetic):
+  src/ballet/fiat-crypto/curve25519_32.c
+  src/ballet/fiat-crypto/curve25519_64.c
+  src/ballet/fiat-crypto/curve25519_scalar_64.c
+  src/ballet/fiat-crypto/curve25519x6_64.c
+
+TEST FILES:
+  src/ballet/ed25519/test_ed25519.c                  -- Main test file
+  src/ballet/ed25519/test_ed25519_cctv.c             -- CCTV test vectors (ed25519vectors)
+  src/ballet/ed25519/test_ed25519_wycheproof.c       -- Wycheproof test vectors (LARGE, auto-generated)
+  src/ballet/ed25519/test_ed25519_signature_malleability.c -- Malleability tests (binary test vectors)
+  src/ballet/ed25519/test_ed25519_signature_malleability_should_fail.bin
+  src/ballet/ed25519/test_ed25519_signature_malleability_should_pass.bin
+
+FUZZ TARGETS:
+  src/ballet/ed25519/fuzz_ed25519_sigverify.c        -- Fuzz: sign then verify roundtrip
+  src/ballet/ed25519/fuzz_ed25519_verify.c           -- Fuzz: random data should never verify
+  src/ballet/ed25519/fuzz_ed25519_sigverify_diff.c   -- CRITICAL: Differential fuzz vs Dalek .so
+
+PRECOMPILE (RUNTIME INTEGRATION):
+  src/flamenco/runtime/program/fd_precompiles.c      -- Ed25519 precompile verify invocation
+
+WIREDANCER (FPGA, not software path):
+  src/wiredancer/py/ed25519_lib.py
+  src/wiredancer/py/ref_ed25519.py
+  src/wiredancer/rtl/ed25519_*.sv
+
+================================================================================
+SECTION 2: CRITICAL FUNCTION ANALYSIS
+================================================================================
+
+----------------------------------------------------------------------
+2.1 fd_ed25519_verify() -- Single signature verification
+     File: fd_ed25519_user.c, lines 136-230
+----------------------------------------------------------------------
+
+ALGORITHM:
+  1. Split sig into R (first 32 bytes) and S (last 32 bytes)
+  2. Validate scalar S: MUST be < L (group order)
+     - Uses fd_curve25519_scalar_validate()
+     - Returns FD_ED25519_ERR_SIG if S >= L
+  3. Decompress public key A' and point R from bytes
+     - Uses fd_ed25519_point_frombytes_2x() for concurrent decompression
+     - Returns ERR_PUBKEY or ERR_SIG if decompression fails
+  4. Check small order:
+     - A' must NOT be small order (order <= 8) -- ERR_PUBKEY
+     - R must NOT be small order (order <= 8)  -- ERR_SIG
+  5. Compute k = SHA512(R || A || msg) mod L
+  6. Compute Rcmp = [k](-A') + [S]B
+     - Note: negates A' first, then uses double_scalar_mul_base
+  7. Compare Rcmp with R using fd_ed25519_point_eq_z1()
+     - This compares in projective coordinates (no compression!)
+
+KEY OBSERVATIONS:
+
+  *** CRITICAL FINDING 1: NO COFACTOR MULTIPLICATION ***
+  The verification equation is: [S]B == R + [k]A'
+  NOT the cofactored version: [8][S]B == [8]R + [8][k]A'
+
+  The comment at line 209 says:
+    "[8][S]B = [8]R + [8][k]A'. It's sufficient, but not required,
+     to instead check [S]B = R + [k]A'."
+
+  However, this is only equivalent when working with prime-order points.
+  Since they reject small-order R and A', this should be safe, but the
+  interaction with non-canonical points is subtle.
+
+  *** CRITICAL FINDING 2: POINT COMPARISON WITHOUT COMPRESSION ***
+  Line 226: fd_ed25519_point_eq_z1(Rcmp, R)
+
+  The developer comment at lines 219-225 explains:
+    "Many implementations do this comparison by compressing Rcmp,
+     and compare it against the r buf as it appears in the signature.
+     This implicitly prevents non-canonical R.
+     However this also hides a field inv to compress Rcmp.
+     In our implementation we compare the points."
+
+  This means: if R is non-canonical (y >= p), Firedancer will still
+  accept it as long as the point equality holds in projective coords.
+
+  Dalek 2.x (used by Agave) also does NOT check canonical R.
+  BUT Dalek 4.x DOES check canonical R.
+
+  The developer explicitly notes this at lines 171-190:
+    "There's another check that we currently do NOT enforce:
+     whether public key and point r are canonical.
+     Dalek 2.x (currently used by Agave) does NOT do any check.
+     Dalek 4.x checks that the point r is canonical, but accepts
+     a non canonical public key."
+
+  *** CRITICAL FINDING 3: SCALAR VALIDATION (S < L) ***
+  Line 159: fd_curve25519_scalar_validate(S)
+
+  This checks S < L where L = 2^252 + 27742317777372353535851937790883648493
+
+  In fd_curve25519_scalar.h lines 59-87:
+  - Fast path: if top 4 bits are 0 (S < 2^252), accept immediately
+  - If top 3 bits set (S >= 2^253), reject immediately
+  - Otherwise, full comparison against L-1
+
+  ZIP-215 says S is NOT required to be < L. Firedancer REJECTS S >= L.
+  This matches Agave/Solana behavior (Solana does NOT use pure ZIP-215;
+  it uses a modified version that requires S < L).
+
+----------------------------------------------------------------------
+2.2 fd_ed25519_verify_batch_single_msg() -- Batch verification
+     File: fd_ed25519_user.c, lines 232-310
+----------------------------------------------------------------------
+
+ALGORITHM: Same checks as single verify, applied to each (sig, pubkey) pair.
+  - Max batch size: 16
+  - Does NOT use randomized batch verification (no random combiners)
+  - Each signature is verified individually in a loop
+  - Uses same fd_ed25519_double_scalar_mul_base per signature
+
+OBSERVATION: The batch verify is NOT an optimization in the traditional
+sense (it doesn't combine all checks into one multi-scalar multiplication
+with random weights). It simply loops over individual verifications.
+This means it MUST produce the exact same result as calling single verify
+N times. This is confirmed by the #if 0 naive implementation at lines 243-251.
+
+*** NO BATCH/SINGLE DIVERGENCE RISK ***
+Since batch just loops over single verifies using identical logic, there
+is no risk of batch accepting what single rejects or vice versa.
+
+----------------------------------------------------------------------
+2.3 Point Decompression: fd_ed25519_point_frombytes()
+     File: fd_curve25519.c, lines 34-61
+----------------------------------------------------------------------
+
+ALGORITHM:
+  1. fd_f25519_frombytes(y, buf) -- deserialize y coordinate
+     - ACCEPTS non-canonical y (y >= p = 2^255 - 19)
+     - Simply reduces mod p implicitly via fiat-crypto
+  2. Extract x sign bit from buf[31] >> 7
+  3. Compute u = y^2 - 1, v = d*y^2 + 1
+  4. fd_f25519_sqrt_ratio(x, u, v) -- compute x = sqrt(u/v)
+     - Returns 0 (failure) if no square root exists
+     - If no sqrt, returns NULL (point not on curve)
+  5. Negate x if sign doesn't match expected
+  6. Compute t = x * y
+  7. Set point to (x, y, 1, t) -- affine representation
+
+*** CRITICAL: NON-CANONICAL Y HANDLING ***
+fd_f25519_frombytes uses fiat_25519_from_bytes which accepts values
+>= p and reduces them. So y = p maps to 0, y = p+1 maps to 1, etc.
+This is exactly the ZIP-215 / Dalek behavior.
+
+*** CRITICAL: NO ON-CURVE CHECK ***
+The decompression will succeed for ANY y that produces a valid sqrt.
+There is no explicit check that the resulting point is on the curve.
+The sqrt_ratio check implicitly ensures the point is on the curve
+(since d*y^2+1 must be a square for the point to exist).
+
+Points on the twist (not on Ed25519 curve) will fail sqrt_ratio
+and return NULL.
+
+----------------------------------------------------------------------
+2.4 Point Comparison: fd_ed25519_point_eq_z1()
+     File: ref/fd_curve25519.h, lines 132-139
+----------------------------------------------------------------------
+
+  FD_25519_INLINE int
+  fd_ed25519_point_eq_z1( fd_ed25519_point_t const * a,
+                          fd_ed25519_point_t const * b ) {
+    fd_f25519_t x1[1], y1[1];
+    fd_f25519_mul( x1, b->X, a->Z );
+    fd_f25519_mul( y1, b->Y, a->Z );
+    return fd_f25519_eq( x1, a->X ) & fd_f25519_eq( y1, a->Y );
+  }
+
+This assumes b has Z==1 (affine/decompressed point).
+Check: b->X * a->Z == a->X AND b->Y * a->Z == a->Y
+Equivalent to: a->X/a->Z == b->X AND a->Y/a->Z == b->Y
+
+This is correct for Extended Twisted Edwards coordinates.
+
+----------------------------------------------------------------------
+2.5 fd_ed25519_affine_is_small_order()
+     File: fd_curve25519.h, lines 88-118
+----------------------------------------------------------------------
+
+Checks if a decompressed (affine, Z==1) point has order dividing 8.
+Method: check if X==0 OR Y==0 OR Y matches known order-8 y-coordinates.
+
+The 8 small-order points are listed in the comments (lines 90-98):
+  P0: (0, 1)  order 1 (identity)
+  P1: (0, -1) order 2
+  P2: (sqrt(-1), 0) order 4
+  -P2: (-sqrt(-1), 0) order 4
+  P3, -P3: order 8
+  P4, -P4: order 8
+
+*** POTENTIAL ISSUE: WORKS ONLY FOR AFFINE POINTS ***
+The function assumes Z==1. If called on a non-affine point, it would
+give wrong results. The verify function calls it right after
+frombytes which returns affine points, so this is safe.
+
+----------------------------------------------------------------------
+2.6 Scalar Reduction: fd_curve25519_scalar_reduce()
+     File: fd_curve25519_scalar.c (too large to fully display)
+----------------------------------------------------------------------
+
+Reduces a 512-bit value mod L. Used for:
+  - Reducing k = SHA512(R || A || msg) to a 256-bit scalar
+  - Reducing r in signing
+
+The scalar_reduce is a standard Barrett reduction.
+
+----------------------------------------------------------------------
+2.7 fd_curve25519_scalar_validate()
+     File: fd_curve25519_scalar.h, lines 58-87
+----------------------------------------------------------------------
+
+Checks if a 256-bit scalar s is in range [0, L).
+- If top 4 bits clear (s < 2^252): accept (fast path)
+- If top 3 bits set (s >= 2^253): reject
+- Otherwise: compare s against L-1 via subtraction with borrow
+
+*** IMPORTANT: This is NOT constant-time ***
+The comment says "Not constant time and thus should not be exposed to secrets."
+This is fine for verification (S is public) but noted for completeness.
+
+================================================================================
+SECTION 3: NON-CANONICAL POINT ANALYSIS
+================================================================================
+
+For each type of non-canonical input, does Firedancer accept or reject?
+
+----------------------------------------------------------------------
+3.1 y >= p (y coordinate >= 2^255 - 19)
+----------------------------------------------------------------------
+
+FIREDANCER: ACCEPTS
+  fd_f25519_frombytes reduces mod p. A point with y=p+k decompresses
+  to the same point as y=k. The decompression succeeds.
+
+  Developer comment confirms: "we accept non-canonical points unlike RFC 8032"
+  (fd_curve25519.h line 182)
+
+  Test confirms: test_point_validate() at line 486:
+    fd_hex_decode(buf, "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff", 32);
+    FD_TEST_CUSTOM(fd_ed25519_point_validate(buf), "fd_ed25519_point_validate(ff..ff)");
+  // non-canonical points are accepted
+
+AGAVE/DALEK 2.x: ACCEPTS (same behavior)
+AGAVE/DALEK 4.x: Would REJECT R if non-canonical (but accept A)
+
+*** CONSENSUS RISK: LOW currently (both accept), but HIGH when Agave
+    upgrades to Dalek 4.x. The commented-out code at lines 184-189
+    in fd_ed25519_user.c shows the developers are aware. ***
+
+----------------------------------------------------------------------
+3.2 Non-canonical encoding of the x-bit
+----------------------------------------------------------------------
+
+The x sign bit is the MSB of byte 31. After fd_f25519_frombytes reduces
+y mod p, the x-bit from the original encoding is used to select the
+sign of x. Even if y was non-canonical, the x-bit still determines
+which square root to pick.
+
+FIREDANCER: ACCEPTS (the x-bit is just used as a selector)
+AGAVE/DALEK: Same behavior
+
+----------------------------------------------------------------------
+3.3 Points on the twist (not on Ed25519 curve)
+----------------------------------------------------------------------
+
+FIREDANCER: REJECTS
+  fd_f25519_sqrt_ratio returns 0 (failure) when the discriminant
+  u/v = (y^2-1)/(dy^2+1) is not a quadratic residue. This means
+  the point is not on the curve.
+
+AGAVE/DALEK: Same behavior (decompression fails)
+
+----------------------------------------------------------------------
+3.4 Small-order points (order dividing 8)
+----------------------------------------------------------------------
+
+FIREDANCER: REJECTS (both A and R)
+  Lines 194-198 in fd_ed25519_user.c:
+    if(fd_ed25519_affine_is_small_order(Aprime)) return ERR_PUBKEY;
+    if(fd_ed25519_affine_is_small_order(R)) return ERR_SIG;
+
+AGAVE/DALEK: Also rejects (Solana uses verify_strict-like behavior
+  that rejects small-order keys and R values)
+
+----------------------------------------------------------------------
+3.5 Mixed-order points (order = 8*L where L is prime order)
+----------------------------------------------------------------------
+
+FIREDANCER: ACCEPTS
+  Mixed-order points pass the small-order check (8P != 0) and
+  pass decompression. They are valid points on the curve.
+
+  The verification equation [S]B = R + [k]A' works correctly for
+  mixed-order points when S < L, since [L]B = 0.
+
+AGAVE/DALEK: Same behavior (accepts mixed-order points)
+
+----------------------------------------------------------------------
+3.6 S >= L (scalar out of range)
+----------------------------------------------------------------------
+
+FIREDANCER: REJECTS
+  fd_curve25519_scalar_validate at line 159 returns NULL if S >= L.
+
+AGAVE: Also REJECTS. Solana explicitly requires S < L.
+  (This differs from pure ZIP-215 which allows S >= L)
+
+================================================================================
+SECTION 4: ZIP-215 COMPLIANCE ANALYSIS
+================================================================================
+
+ZIP-215 specifies:
+  1. R and A are NOT required to be on the curve  -> N/A (decompression handles)
+  2. R and A are NOT required to be canonical      -> Firedancer ACCEPTS non-canonical
+  3. S is NOT required to be < L                   -> Firedancer REJECTS S >= L
+  4. Check: [8][S]B = [8]R + [8][k]A              -> Firedancer uses [S]B = R + [k]A
+
+Solana does NOT use pure ZIP-215. It uses a modified version:
+  - S MUST be < L (stricter than ZIP-215)
+  - Small-order points are REJECTED (stricter than ZIP-215)
+  - Non-canonical y coordinates are ACCEPTED (matches ZIP-215)
+  - No cofactor multiplication (matches cofactorless variant)
+
+*** FIREDANCER MATCHES SOLANA'S MODIFIED ZIP-215 ***
+Both Firedancer and Agave:
+  - Require S < L
+  - Reject small-order A and R
+  - Accept non-canonical y coordinates
+  - Use cofactorless verification equation
+
+================================================================================
+SECTION 5: POTENTIAL CONSENSUS-SPLITTING VECTORS
+================================================================================
+
+----------------------------------------------------------------------
+VECTOR 1: NON-CANONICAL R POINT COMPARISON (MEDIUM-HIGH RISK)
+----------------------------------------------------------------------
+
+Firedancer compares R (computed) with R (from signature) using
+fd_ed25519_point_eq_z1() which works in projective coordinates.
+
+Dalek compresses the computed R point and compares the bytes.
+
+If R in the signature is non-canonical (y >= p), then:
+  - Firedancer: decompresses R (reducing y mod p), computes Rcmp,
+    compares in projective coords. If Rcmp matches the reduced point,
+    ACCEPTS.
+  - Dalek 2.x: decompresses R similarly, computes Rcmp, compresses
+    Rcmp (which produces canonical bytes), compares against original
+    R bytes. Since original R is non-canonical but compressed Rcmp is
+    canonical, they WON'T match. REJECTS.
+
+*** WAIT: This would be a consensus split! ***
+
+BUT: The developer comment at lines 177-180 says:
+  "I couldn't find any test with non canonical points (all tests are
+   non canonical + low order, that are excluded by the verify_strict
+   rule). The reason is that to write such a test one needs to know
+   the discrete log of a non canonical point."
+
+This means: to exploit this, we'd need a valid signature where R is
+non-canonical. Since R = [r]B is computed by the signer, the signer
+would need to produce a non-canonical R. But tobytes() always produces
+canonical output. So a legitimate signer cannot produce non-canonical R.
+
+However, a MALICIOUS signer could manually construct a signature with
+non-canonical R. The question is: would the equation still hold?
+
+If R_nc is non-canonical encoding of point P, and R_c is canonical
+encoding of the same point P:
+  - Firedancer decompresses R_nc to P, checks [S]B - [k]A' == P
+  - Dalek decompresses R_nc to P, computes Rcmp = [S]B - [k]A',
+    compresses Rcmp to R_c, compares R_c != R_nc. REJECTS.
+
+*** POTENTIAL CONSENSUS BUG: Firedancer ACCEPTS, Dalek 2.x REJECTS ***
+*** for signatures with non-canonical R encoding ***
+
+HOWEVER: We need to verify that Dalek 2.x actually compresses and
+compares. Some versions might also compare in projective coords.
+The fuzz_ed25519_sigverify_diff.c exists to catch exactly this kind
+of discrepancy.
+
+----------------------------------------------------------------------
+VECTOR 2: POINT EQUALITY EDGE CASES (LOW RISK)
+----------------------------------------------------------------------
+
+fd_ed25519_point_eq_z1 checks:
+  b->X * a->Z == a->X  AND  b->Y * a->Z == a->Y
+
+Edge case: What if a->Z == 0? This would mean a is the "point at infinity"
+in an unusual representation. In proper extended coordinates, the identity
+is (0:1:1:0), not Z=0. If Z=0 somehow occurs due to computation error,
+the check would degenerate. But this is extremely unlikely in practice.
+
+----------------------------------------------------------------------
+VECTOR 3: SMALL ORDER DETECTION COMPLETENESS (LOW RISK)
+----------------------------------------------------------------------
+
+fd_ed25519_affine_is_small_order checks X==0 OR Y==0 OR Y matches
+specific values. This covers all 8 small-order points listed in the
+comments. The implementation appears complete.
+
+BUT: What about non-canonical encodings of small-order points?
+e.g., encoding of (0,1) with y = p+1 = 2^255 - 18?
+
+After decompression, fd_f25519_frombytes reduces y mod p, so y=p+1
+becomes y=1. Then X would be computed as 0. The small-order check
+would catch X==0.
+
+So non-canonical encodings of small-order points are still caught.
+
+----------------------------------------------------------------------
+VECTOR 4: AVX512 vs REFERENCE DIVERGENCE (LOW-MEDIUM RISK)
+----------------------------------------------------------------------
+
+The code dispatches at compile time:
+  #if FD_HAS_AVX512
+    #include "avx512/fd_curve25519.c"
+  #else
+    #include "ref/fd_curve25519.c"
+  #endif
+
+Both implementations use the same algorithm (Extended Twisted Edwards)
+but different field arithmetic representations:
+  - ref: fiat-crypto generated code, 5x51-bit limbs (64-bit mode)
+  - avx512: r43x6 representation (6x43-bit limbs in AVX512 vectors)
+
+The higher-level logic (fd_ed25519_user.c, fd_curve25519.c) is shared.
+Only the low-level field and point operations differ.
+
+The fuzz tests in fuzz_ed25519_sigverify.c and fuzz_ed25519_verify.c
+test only one backend at a time. The differential fuzzer in
+fuzz_ed25519_sigverify_diff.c compares Firedancer vs Dalek, NOT
+ref vs avx512.
+
+*** TESTING GAP: No test explicitly compares ref vs avx512 ***
+If there's a subtle difference in how non-canonical field elements
+are handled between fiat-crypto and r43x6, it could cause consensus
+issues between validators running different hardware.
+
+----------------------------------------------------------------------
+VECTOR 5: fd_f25519_is_zero EDGE CASES (MEDIUM RISK)
+----------------------------------------------------------------------
+
+In ref/fd_f25519.h, fd_f25519_is_zero checks:
+  - All limbs == 0, OR
+  - All limbs == p (in limb representation)
+
+It checks exactly these two representations. But after non-reducing
+operations (add_nr, sub_nr), intermediate values could be 2p or -p etc.
+The function is called from fd_ed25519_affine_is_small_order which
+operates on freshly decompressed (hence reduced) points, so this
+should be safe.
+
+BUT: What if frombytes doesn't fully reduce? fiat_25519_from_bytes
+is supposed to produce a canonical internal representation, but if
+the input is near 2p (y = p + small_value), is the output fully
+carried/reduced?
+
+The test file confirms this works:
+  fd_hex_decode(s, "edffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f", 32);
+  fd_f25519_frombytes(h, s); // y = p = 2^255-19
+  FD_TEST(fd_f25519_is_zero(h)); // correctly identifies as zero
+
+  fd_hex_decode(s, "edffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff", 32);
+  fd_f25519_frombytes(h, s); // y = p + 2^255 (top bit set)
+  FD_TEST(fd_f25519_is_zero(h)); // correctly identifies as zero
+
+----------------------------------------------------------------------
+VECTOR 6: SIGNATURE MALLEABILITY / S = L-1 BOUNDARY (LOW RISK)
+----------------------------------------------------------------------
+
+The scalar validation in fd_curve25519_scalar_validate:
+  - Compares s against L-1 = 0xEC...ED via subtraction
+  - Uses borrow chain: subtracts (L-1) from s starting with initial borrow=1
+    effectively computing s - L
+  - If result has borrow (s < L): accept
+  - If no borrow (s >= L): reject
+
+The boundary value S = L-1 should be accepted (valid).
+S = L should be rejected.
+
+The malleability test files (should_pass.bin, should_fail.bin) test
+this with real signatures over "Zcash" message.
+
+================================================================================
+SECTION 6: DEVELOPER COMMENTS AND KNOWN ISSUES
+================================================================================
+
+TODO/FIXME in codebase:
+
+1. fd_ed25519_user.c line 263:
+   "TODO: optimize, this is 20% of the total time."
+   (About batch verify initial validation loop)
+
+2. fd_curve25519_scalar.h line 127:
+   "//TODO implement dedicated neg/sub"
+
+3. fd_curve25519_scalar.h line 156:
+   "// TODO: use mul chain to save ~12%"
+
+4. fd_f25519.h line 157:
+   "//TODO: make it faster" (in fd_f25519_sgn)
+
+5. test_ed25519.c line 445:
+   "/* FIXME: ADD VMUL, VSQ, VSQN TESTS HERE */"
+
+6. test_ed25519.c line 449:
+   "/* FIXME: ADD GE TESTS HERE */"
+
+Developer awareness comment (fd_ed25519_user.c lines 167-190):
+  The developer is fully aware of the non-canonical R issue and has
+  commented-out code ready for when Agave switches to Dalek 4.x.
+  This suggests they have intentionally matched Dalek 2.x behavior
+  but may need to update in the future.
+
+================================================================================
+SECTION 7: DIFFERENTIAL FUZZER ANALYSIS
+================================================================================
+
+File: fuzz_ed25519_sigverify_diff.c
+
+This fuzzer:
+  1. Loads Dalek .so at runtime via dlopen
+  2. For each fuzz input:
+     a. Generates keypair (C and Rust)
+     b. Signs message (C and Rust), asserts signatures match
+     c. Verifies legitimate signature (C and Rust), asserts both pass
+     d. Verifies random signature (C and Rust), asserts results match
+
+*** CRITICAL OBSERVATION ***
+Step (d) only tests with RANDOM signatures against the SAME public key
+derived from a random private key. It does NOT test:
+  - Non-canonical R encodings
+  - Non-canonical A (pubkey) encodings
+  - Specifically crafted small-order components
+  - S values near the boundary of L
+  - Mixed-order point signatures
+
+The fuzzer generates pub from prv, which always produces canonical
+pubkeys. The random signatures will almost certainly have invalid
+decompression for R, so most fuzz iterations test the rejection paths
+for obviously invalid signatures.
+
+*** TESTING GAP: The differential fuzzer does not specifically target
+    the non-canonical R vector described in VECTOR 1 above. ***
+
+================================================================================
+SECTION 8: SPECIFIC TEST CASES TO TRY
+================================================================================
+
+TEST CASE 1: Non-canonical R with valid equation
+  Construct a signature (R_nc, S) over message M with public key A where:
+  - R_nc is a non-canonical encoding of point P (y >= p, same point as y mod p)
+  - The equation [S]B = P + [k]A holds (where k = H(R_nc || A || M))
+  - S < L
+
+  DIFFICULTY: Need to know discrete log of P. If signer controls R,
+  they can compute S = r + k*a mod L normally, but then encode R
+  non-canonically by adding p to the y-coordinate bytes.
+
+  PROCEDURE:
+  1. Generate keypair (a, A)
+  2. Sign message M normally: R = [r]B, S = r + H(R||A||M)*a mod L
+  3. Get canonical R_c = tobytes(R)
+  4. Create R_nc by adding p to y-coordinate: R_nc = R_c with byte[31] = R_c[31]
+     and the lower 255 bits adjusted to be y+p (or y+2p if y < 19)
+
+  NOTE: This requires careful construction. If y < 19, then y+p < 2^255
+  and we need to set y = y+p in the bytes (no change to x-bit).
+  If y >= 19, then y+p >= 2^255 and the MSB would overflow into the
+  x-bit position.
+
+  ACTUALLY: The encoding stores y in the first 255 bits (bit 0-254 of
+  the 32 bytes), and the x sign bit in bit 255 (MSB of byte 31).
+  To make R non-canonical, we need y_bytes such that interpreting
+  bits 0-254 gives a value >= p. This means the 255-bit value must be
+  in [p, 2^255) = [2^255-19, 2^255). There are only 19 such values.
+
+  For y in [0, 18], the non-canonical encoding has bits_0_254 = y + p.
+  Since p = 2^255 - 19, y + p = 2^255 - 19 + y.
+  For y=0: bits_0_254 = 2^255 - 19 (= 0xed..ff7f in LE)
+  For y=18: bits_0_254 = 2^255 - 1 (= 0xff..ff7f in LE)
+
+  So: pick any keypair, sign a message, check if R has y < 19.
+  If so, construct R_nc with y' = y + p. Recalculate k' = H(R_nc || A || M).
+  Since k' != k (different R bytes in hash), S needs to satisfy
+  [S]B = [r]B + [k']A, i.e., S = r + k'*a mod L.
+
+  So: recompute S using the non-canonical R encoding in the hash.
+  This gives a valid signature (R_nc, S') that Firedancer might accept
+  but Dalek might reject.
+
+TEST CASE 2: All 8 small-order points as R and A
+  For each of the 8 small-order points, test:
+  - As public key A with any signature
+  - As R component of signature
+  Both should be rejected by Firedancer. Verify Agave matches.
+
+TEST CASE 3: S = L-1 (maximum valid scalar)
+  Create a signature with S = L-1. This is at the boundary of validity.
+
+TEST CASE 4: S = L (should be rejected)
+  Create a signature with S = L. Should be rejected by both.
+
+TEST CASE 5: Non-canonical A (public key with y >= p)
+  A public key where the y-coordinate encoding is >= p.
+
+  This should decompress to the same point as y mod p.
+  Firedancer accepts this. Does Agave?
+
+TEST CASE 6: R and A with y = 0 (small-order check)
+  Point (sqrt(-1), 0) has order 4. Verify it's rejected.
+
+TEST CASE 7: Mixed-order public key
+  Public key that has order 8L (not prime order).
+  The signature should work if the equation holds.
+
+TEST CASE 8: Identity point variations
+  - A = (0, 1) canonical encoding: 01000...000
+  - A = (0, 1) non-canonical: edffff...ff7f (y=p maps to 0, then 0+1=1? no)
+
+  Actually (0,1) has y=1, which has unique canonical encoding.
+  The identity is encoded as 0x01000...000.
+
+================================================================================
+SECTION 9: ROADMAP - WHAT TO TEST NEXT
+================================================================================
+
+PRIORITY 1 (HIGHEST - potential consensus split):
+  [ ] Construct non-canonical R test case (TEST CASE 1 above)
+      - Write a program that signs, then creates non-canonical R
+      - Test against both Firedancer and Dalek
+      - This is the most likely consensus-splitting vector
+
+  [ ] Verify exact Dalek 2.x behavior on non-canonical R
+      - Does ed25519-dalek 2.x compress Rcmp before comparing?
+      - Or does it also compare in projective coords?
+      - Read Dalek source code to confirm
+
+PRIORITY 2 (HIGH):
+  [ ] Test AVX512 vs ref implementation equivalence
+      - Build Firedancer with both backends
+      - Run same test vectors through both
+      - Focus on non-canonical inputs and boundary cases
+
+  [ ] Extend differential fuzzer with crafted inputs
+      - Add non-canonical R encodings to corpus
+      - Add boundary S values to corpus
+      - Add non-canonical A encodings to corpus
+
+PRIORITY 3 (MEDIUM):
+  [ ] Audit fd_f25519_is_zero for edge cases
+      - What happens with intermediate non-reduced values?
+      - Test with values = 2p, 3p, etc.
+
+  [ ] Audit fd_f25519_sqrt_ratio for edge cases
+      - What happens at u=0, v=0?
+      - Both-zero case?
+
+  [ ] Test the wycheproof vectors cover all edge cases
+      - Map each vector to the non-canonical category
+      - Identify any gaps in coverage
+
+PRIORITY 4 (LOWER):
+  [ ] Review WNAF scalar representation for correctness
+      - fd_curve25519_scalar_wnaf with different bit sizes
+      - Edge cases: scalar = 0, scalar = L-1
+
+  [ ] Review precomputed table generation
+      - Are tables correct for both ref and avx512?
+      - Offline verification possible?
+
+  [ ] Check that the precompile (fd_precompiles.c) correctly
+      passes all parameters to fd_ed25519_verify
+      - Message offset/size calculations
+      - Error code mapping
+
+================================================================================
+SECTION 10: SUMMARY OF KEY FINDINGS
+================================================================================
+
+1. **MOST PROMISING BUG VECTOR**: Non-canonical R encoding in signatures.
+   Firedancer compares points in projective coordinates (accepting
+   non-canonical R), while Dalek 2.x may compare compressed bytes
+   (rejecting non-canonical R). The developers are aware (commented-out
+   fix exists) but believe current Dalek 2.x also accepts. NEEDS
+   VERIFICATION against actual Dalek code.
+
+2. **NO COFACTOR ISSUE**: Firedancer uses cofactorless verification
+   but compensates by rejecting small-order points. This matches
+   Agave/Solana's approach.
+
+3. **BATCH = SINGLE**: No divergence risk between batch and single
+   verify since batch just loops over single.
+
+4. **S < L ENFORCED**: Both Firedancer and Agave require S < L,
+   deviating from pure ZIP-215.
+
+5. **TESTING GAPS**:
+   - No explicit ref vs avx512 comparison tests
+   - Differential fuzzer doesn't target non-canonical inputs
+   - FIXME comments indicate missing GE tests and vectorized tests
+
+6. **FUTURE RISK**: When Agave upgrades to Dalek 4.x, the non-canonical
+   R handling will diverge. The Firedancer developers have prepared for
+   this (commented-out code) but it's not yet active.
+
+================================================================================
+END OF ANALYSIS
+================================================================================

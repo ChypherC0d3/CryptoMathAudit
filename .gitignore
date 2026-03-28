@@ -1,0 +1,25 @@
+# External repos (cloned targets - too large, not our code)
+targets/firedancer/firedancer/
+targets/hyperlane/hyperlane-monorepo/
+targets/zksync/
+targets/layerzero/
+
+# Build artifacts
+*.exe
+*.obj
+*.o
+*.bin
+*.pdb
+
+# Rust build
+target/
+Cargo.lock
+
+# Python cache
+__pycache__/
+*.pyc
+
+# Large data files
+*.csv
+*.tsv
+*.gz

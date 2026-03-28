@@ -1,0 +1,170 @@
+===============================================================================
+HYPOTHESIS H5: Differences between Ed25519 precompile verification and
+               transaction sigverify in Firedancer
+===============================================================================
+Date: 2026-03-28
+Status: NEGATIVE (No exploitable divergence found)
+
+===============================================================================
+1. OVERVIEW
+===============================================================================
+
+Solana has TWO Ed25519 verification paths:
+  Path A: Transaction signature verification (sigverify)
+  Path B: Ed25519 precompile program (verifies arbitrary Ed25519 signatures)
+
+In Agave, both use verify_strict after feature gate activation.
+The question: Does Firedancer use the SAME underlying crypto for both?
+
+===============================================================================
+2. PATH A: TRANSACTION SIGVERIFY
+===============================================================================
+
+There are TWO sub-paths for transaction sigverify in Firedancer:
+
+  A1. Networking verify tile (incoming transactions):
+      File: src/disco/verify/fd_verify_tile.h:91
+      Function: fd_ed25519_verify_batch_single_msg()
+      Called from: fd_txn_verify() in the verify tile
+      Purpose: Verify signatures on incoming network transactions
+
+  A2. Replay/executor sigverify (block replay):
+      File: src/flamenco/runtime/fd_executor.c:1430
+      Function: fd_ed25519_verify_batch_single_msg()
+      Called from: fd_executor_txn_verify()
+      Used by: src/discof/execrp/fd_execrp_tile.c:264
+
+Both sub-paths call the SAME function: fd_ed25519_verify_batch_single_msg()
+
+===============================================================================
+3. PATH B: ED25519 PRECOMPILE
+===============================================================================
+
+File: src/flamenco/runtime/program/fd_precompiles.c:125-222
+Function: fd_precompile_ed25519_verify()
+
+This function:
+  1. Parses instruction data to extract sig_cnt, offsets
+  2. For each signature, extracts sig, pubkey, msg from instruction data
+  3. Calls fd_ed25519_verify() at line 215
+
+Key call:
+  fd_ed25519_verify( msg, msg_sz, sig, pubkey, sha )
+
+===============================================================================
+4. CORE CRYPTO COMPARISON
+===============================================================================
+
+Both paths ultimately use functions from:
+  src/ballet/ed25519/fd_ed25519_user.c
+
+  fd_ed25519_verify() (single signature) - line 136
+  fd_ed25519_verify_batch_single_msg() (batch) - line 232
+
+CRITICAL FINDING: fd_ed25519_verify_batch_single_msg() performs
+EXACTLY THE SAME checks as fd_ed25519_verify():
+
+  Both perform:
+    1. fd_curve25519_scalar_validate(S) - scalar range check
+    2. fd_ed25519_point_frombytes_2x() - decompress pubkey and R
+    3. fd_ed25519_affine_is_small_order(Aprime) - small order pubkey check
+    4. fd_ed25519_affine_is_small_order(R) - small order R check
+    5. SHA-512 hash of (R || pubkey || msg) -> k
+    6. fd_curve25519_scalar_reduce(k)
+    7. fd_ed25519_double_scalar_mul_base() - [k](-A') + [S]B
+    8. fd_ed25519_point_eq_z1() - compare computed R with signature R
+
+  The batch version simply loops these steps for each signature.
+  There is NO random linear combination or probabilistic batch verification.
+  It is a deterministic loop that calls the same operations.
+
+===============================================================================
+5. DIFFERENCES IN INPUT HANDLING (NON-CRYPTO)
+===============================================================================
+
+Sigverify path (Path A):
+  - Input: raw transaction payload
+  - Signatures extracted from txn->signature_off
+  - Pubkeys extracted from txn->acct_addr_off
+  - Message is txn->message_off to end of payload
+
+Precompile path (Path B):
+  - Input: instruction data with offset structure
+  - Uses fd_precompile_get_instr_data() to fetch sig/pubkey/msg
+  - Can reference data from OTHER instructions (cross-instruction)
+  - Has special USHORT_MAX index meaning "current instruction"
+  - sig, pubkey, msg can come from different instruction indices
+
+These differences are in the PARSING layer, not the crypto layer.
+
+===============================================================================
+6. SUBTLE NOTES
+===============================================================================
+
+a) The precompile comments mention (lines 181-183, 196-198):
+   "Note: we parse the signature/public key as part of fd_ed25519_verify.
+    Because of this, the return error code might be different from Agave
+    in some edge cases."
+
+   This means Firedancer does NOT pre-validate the signature bytes or
+   pubkey bytes before passing them to fd_ed25519_verify. Instead,
+   fd_ed25519_verify itself catches invalid inputs. The error codes
+   returned may differ from Agave, but since all errors are fatal
+   (tx fails), this is a consensus-compatible difference.
+
+b) The precompile does NOT call fd_ed25519_verify_batch_single_msg.
+   Instead it calls fd_ed25519_verify (single) in a loop. This is
+   because each signature in the precompile can have a DIFFERENT
+   message (unlike txn sigverify where all sigs are over the same msg).
+
+c) Both fd_ed25519_verify and fd_ed25519_verify_batch_single_msg
+   implement verify_strict (small order rejection). Neither implements
+   the non-strict verify path. This matches Agave post-feature-gate.
+
+d) The comment at fd_ed25519_user.c:171-190 notes that canonical
+   point checking for R is NOT enforced (matching Dalek 2.x behavior
+   in current Agave). Code for checking R canonicality exists but is
+   commented out, ready for when Agave switches to Dalek 4.x.
+
+===============================================================================
+7. CONCLUSION
+===============================================================================
+
+RESULT: H5 is NEGATIVE.
+
+Both Ed25519 verification paths in Firedancer use the SAME underlying
+cryptographic implementation:
+  - Sigverify uses fd_ed25519_verify_batch_single_msg (which loops
+    fd_ed25519_verify internally)
+  - Precompile uses fd_ed25519_verify directly
+
+Both functions:
+  - Live in the same file (fd_ed25519_user.c)
+  - Perform identical cryptographic checks
+  - Implement verify_strict (small order rejection)
+  - Use the same scalar validation, point decompression, and verification
+
+There is NO divergence between the two paths at the cryptographic level.
+The only differences are in input parsing (how sig/pubkey/msg are
+extracted), which is expected and correct.
+
+No exploitable bug found via this hypothesis.
+
+===============================================================================
+8. FILES EXAMINED
+===============================================================================
+
+Precompile:
+  src/flamenco/runtime/program/fd_precompiles.c
+  src/flamenco/runtime/program/fd_precompiles.h
+
+Sigverify (network):
+  src/disco/verify/fd_verify_tile.h
+
+Sigverify (replay):
+  src/flamenco/runtime/fd_executor.c (fd_executor_txn_verify)
+  src/discof/execrp/fd_execrp_tile.c
+
+Core Ed25519 crypto:
+  src/ballet/ed25519/fd_ed25519.h
+  src/ballet/ed25519/fd_ed25519_user.c

@@ -1,0 +1,613 @@
+================================================================================
+LAYERZERO PROTOCOL - COMPREHENSIVE RECONNAISSANCE REPORT
+================================================================================
+Date: 2026-03-27
+Target: LayerZero (Omnichain Interoperability Protocol)
+Bug Bounty: Immunefi - https://immunefi.com/bug-bounty/layerzero/
+Max Payout: $15,000,000 USD
+
+================================================================================
+1. BUG BOUNTY SCOPE (IMMUNEFI)
+================================================================================
+
+Program launched: May 17, 2023
+Last updated: November 11, 2025
+Triaged by: Immunefi
+Requirements: PoC (mandatory), KYC (mandatory), Arbitration enabled
+
+1.1 IN-SCOPE ASSETS (25 Smart Contracts)
+-----------------------------------------
+
+EVM Contracts:
+  - UltraLightNodeV2.sol (V1 legacy)
+  - FPValidator.sol (V1 legacy)
+  - Endpoint (EVM)
+  - EndpointV2 (EVM)
+  - SendULN301 (EVM)
+  - SendULN302 (EVM)
+  - ReceiveULN301 (EVM)
+  - ReceiveULN302 (EVM)
+  - DVN (EVM)
+  - OFT, OFTv1.2, ONFT721, ONFT1155 (EVM)
+  - OApp (EVM), OFT (EVM)
+
+Solana Contracts:
+  - EndpointV2 (Solana)
+  - SendULN302 (Solana)
+  - ReceiveULN302 (Solana)
+  - DVN (Solana)
+  - OFT (Solana)
+
+Aptos:
+  - Endpoint (Aptos)
+
+TON:
+  - Controller, ULNManager, DVNProxy (TON)
+
+Other:
+  - Primacy of Impact asset placeholder
+
+1.2 SEVERITY LEVELS AND PAYOUTS
+---------------------------------
+
+CRITICAL (up to $15,000,000):
+  - V1 Group 1 (ETH, BNB, AVAX, MATIC, ARB, OP, FTM): min $250,000, or
+    10% of value at risk, hard cap $15M
+  - V1 Group 2 (all other chains): max $1,500,000
+  - V2: min $100,000, or 10% of value at risk, hard cap $15M
+  - Direct theft of funds, permanent freezing of funds
+  - Protocol insolvency
+
+HIGH (up to $250,000):
+  - Governance voting manipulation
+  - Temporary freezing of funds (>24h)
+
+MEDIUM (up to $25,000):
+  - Griefing attacks (no profit motive, but damage to protocol)
+  - Smart contract unable to operate
+
+LOW (up to $10,000):
+  - OApp/OFT/ONFT impacts capped at low severity
+  - Contract returning incorrect values
+
+1.3 OUT OF SCOPE
+-----------------
+  - Sybil attacks
+  - OApp misconfiguration impacts
+  - LayerZero infrastructure DoS
+  - Previously known/reported bugs
+  - Dependencies and third-party code (unless impact on in-scope assets)
+  - Configuration race-condition temporary impacts
+  - Oracle manipulation (standalone)
+  - 51% attacks
+  - Lack of liquidity impacts
+  - Centralization risks
+  - Bugs requiring compromised admin keys (unless provable)
+
+1.4 SPECIAL CONDITIONS
+-----------------------
+  - Testing: LOCAL FORKS ONLY. No mainnet/public testnet testing.
+  - No oracle or third-party contract testing.
+  - Primacy of Impact: Critical/High bypass asset specificity.
+  - Cross-chain impacts treated as one singular issue across chains.
+  - Payout: USDC/USDT/BUSD via wire or stablecoin. LayerZero handles directly.
+  - KYC: Invoice, address proof, government ID, OFAC clearance required.
+  - Total bounties paid to date: ~$1M to whitehats.
+
+================================================================================
+2. GITHUB REPOSITORIES
+================================================================================
+
+Organization: https://github.com/LayerZero-Labs (33 repositories)
+
+2.1 CORE PROTOCOL REPOS
+-------------------------
+
+LayerZero-v2 (PRIMARY TARGET):
+  URL: https://github.com/LayerZero-Labs/LayerZero-v2
+  Contains: Immutable protocol contracts, MessageLibs, DVN, Executor
+  Structure:
+    /protocol/        - Core EndpointV2, immutable contracts
+    /messagelib/      - SendUln301, SendUln302, ReceiveUln301, ReceiveUln302
+    /oapp/            - OApp standard contracts
+    /messagelib/contracts/uln/dvn/  - DVN contracts (KEY TARGET)
+
+LayerZero-v1 (LEGACY, still in scope):
+  URL: https://github.com/LayerZero-Labs/LayerZero-v1
+  Contains: UltraLightNodeV2.sol, FPValidator.sol, Endpoint
+
+devtools:
+  URL: https://github.com/LayerZero-Labs/devtools
+  Contains: OApp/OFT examples, CLI tools, SDK
+
+Audits:
+  URL: https://github.com/LayerZero-Labs/Audits
+  Contains: All past audit reports
+
+stablecoin-evm:
+  URL: https://github.com/LayerZero-Labs/stablecoin-evm
+  Contains: USDT0 and stablecoin contracts
+
+2.2 KEY FILE PATHS (V2)
+-------------------------
+
+Core Protocol:
+  packages/layerzero-v2/evm/protocol/contracts/EndpointV2.sol
+  packages/layerzero-v2/evm/protocol/contracts/MessageLibManager.sol
+
+Message Libraries:
+  packages/layerzero-v2/evm/messagelib/contracts/uln/UlnBase.sol
+  packages/layerzero-v2/evm/messagelib/contracts/uln/ReceiveUlnBase.sol
+  packages/layerzero-v2/evm/messagelib/contracts/SendLibBaseE2.sol
+  packages/layerzero-v2/evm/messagelib/contracts/uln/SendUln302.sol
+  packages/layerzero-v2/evm/messagelib/contracts/uln/ReceiveUln302.sol
+
+DVN Contracts (SIGNATURE VERIFICATION):
+  packages/layerzero-v2/evm/messagelib/contracts/uln/dvn/DVN.sol
+  packages/layerzero-v2/evm/messagelib/contracts/uln/dvn/MultiSig.sol   *** KEY FILE ***
+  packages/layerzero-v2/evm/messagelib/contracts/uln/dvn/DVNFeeLib.sol
+  packages/layerzero-v2/evm/messagelib/contracts/uln/dvn/SimpleReadDVN.sol
+  packages/layerzero-v2/evm/messagelib/contracts/uln/dvn/adapters/
+
+OApp/OFT:
+  packages/layerzero-v2/evm/oapp/contracts/oapp/OApp.sol
+  packages/layerzero-v2/evm/oapp/contracts/oft/
+
+Solana:
+  packages/layerzero-v2/solana/programs/
+
+================================================================================
+3. CRYPTOGRAPHIC ARCHITECTURE
+================================================================================
+
+3.1 HIGH-LEVEL ARCHITECTURE (V2)
+----------------------------------
+
+LayerZero V2 has four core components:
+  1. Immutable Endpoint     - Censorship-resistant message passing
+  2. MessageLib Registry    - Append-only registry of verification modules
+  3. DVNs                   - Decentralized Verifier Networks
+  4. Executors              - Execute feature logic in isolation
+
+Message flow:
+  Source Chain:  OApp -> EndpointV2 -> SendUln302 -> [DVN fee paid]
+  Off-chain:    DVN detects PacketSent event, verifies payload hash
+  Dest Chain:   DVN calls ReceiveUln302.verify() -> commitVerification() ->
+                EndpointV2 -> OApp.lzReceive()
+
+3.2 DVN (DECENTRALIZED VERIFIER NETWORK) ARCHITECTURE
+-------------------------------------------------------
+
+DVN = smart contract + off-chain infrastructure
+
+Verification Model: X-of-Y-of-N quorum
+  - X = required (mandatory) DVNs that ALL must verify
+  - Y = threshold of optional DVNs that must verify
+  - N = total optional DVN pool
+
+UlnConfig struct:
+  - confirmations: required block confirmations
+  - requiredDVNCount (X): all must verify
+  - optionalDVNCount (N): total optional DVNs
+  - optionalDVNThreshold (Y): minimum optional verifications
+  - requiredDVNs[]: addresses
+  - optionalDVNs[]: addresses
+
+Maximum: 254 DVNs composable per Security Stack
+
+DVN is protocol-agnostic -- can use ANY verification method:
+  - ECDSA multi-sig (most common, used by LayerZero Labs DVN)
+  - Zero-knowledge proofs
+  - Sidechain consensus
+  - Native bridges
+  - Restaking/slashing (EigenLayer AVS)
+  - MPC/threshold signatures
+
+3.3 SIGNATURE SCHEME -- MultiSig.sol (THE KEY CONTRACT)
+---------------------------------------------------------
+
+Location: packages/layerzero-v2/evm/messagelib/contracts/uln/dvn/MultiSig.sol
+
+Scheme: ECDSA multi-signature with quorum threshold
+
+Implementation Details:
+  - Uses OpenZeppelin's ECDSA.tryRecover()
+  - Ethereum signed message prefix: "\x19Ethereum Signed Message:\n32"
+  - Each signature is exactly 65 bytes (r=32, s=32, v=1)
+  - Signature length validation: requires exactly quorum * 65 bytes
+  - Signer ordering: each recovered signer must be lexicographically greater
+    than the previous (prevents duplicate signatures)
+  - Each recovered signer must be in the authorized signer set
+    (EnumerableSet)
+
+verifySignatures(bytes32 _hash, bytes calldata _signatures):
+  1. Check _signatures.length == quorum * 65
+  2. For each 65-byte chunk:
+     a. Compute ethSignedHash = keccak256("\x19Ethereum Signed Message:\n32" || _hash)
+     b. ECDSA.tryRecover(ethSignedHash, signature_chunk)
+     c. Verify recovered address > previous recovered address (ascending order)
+     d. Verify recovered address is an authorized signer
+  3. If all pass, signatures are valid
+
+Quorum Safeguards:
+  - Quorum cannot be zero
+  - Signer count must always exceed quorum
+  - Cannot remove signers below quorum threshold
+
+3.4 ULN VERIFICATION FLOW (ReceiveUln302)
+-------------------------------------------
+
+ReceiveUln302.verify(bytes calldata _packetHeader, bytes32 _payloadHash,
+                     uint64 _confirmations):
+  - Called by DVN contracts (msg.sender = DVN address)
+  - Stores: hashLookup[headerHash][payloadHash][dvnAddress] = Verification(true, confirmations)
+  - Emits PayloadVerified event
+  - NOTE: The ULN itself does NOT verify ECDSA signatures -- it only tracks
+    which DVN contracts have called verify(). Signature verification happens
+    WITHIN each DVN contract (MultiSig.sol).
+
+ReceiveUln302.commitVerification(bytes calldata _packetHeader, bytes32 _payloadHash):
+  - Can be called by anyone
+  - Checks all required DVNs have verified
+  - Checks optionalDVNThreshold met
+  - Commits to Endpoint
+
+3.5 DVN.sol EXECUTION AND REPLAY PROTECTION
+---------------------------------------------
+
+DVN.sol inherits MultiSig.sol
+
+execute(ExecuteParam[] calldata _params):
+  - Admin-only function
+  - For each param: hash = hashCallData(vid, target, expiration, callData)
+  - Checks hash not in usedHashes (replay protection)
+  - Verifies quorum signatures via verifySignatures(hash, signatures)
+  - Marks hash as used
+  - Executes calldata against target
+  - If execution reverts, unmarks hash to allow retry
+
+hashCallData: keccak256(abi.encodePacked(_vid, _target, _expiration, _callData))
+  - _vid: unique DVN instance identifier (prevents cross-DVN replay)
+  - _target: contract to call
+  - _expiration: timestamp-based expiry
+  - _callData: the actual function call
+
+OPTIMIZATION NOTE: "to save gas, we don't check hash for some functions
+(where replaying won't change the state)" -- exempts stateless operations
+like verify() calls via _shouldCheckHash(bytes4 selector).
+
+3.6 NONCE AND REPLAY PROTECTION (Protocol Level)
+--------------------------------------------------
+
+Packet structure includes:
+  - uint64 nonce: sequential per-channel, prevents replay
+  - GUID: globally unique identifier
+
+Exactly-once delivery:
+  - Verified hash deleted from lossless channel after delivery
+  - Nonces <= lazy inbound nonce are disallowed for re-verification
+  - Channel isolation: per-pathway, per-OApp
+
+Lazy nonce mechanism:
+  - Tracks highest consecutively delivered message
+  - Messages can be verified out of order
+  - Execution is sequential from lazy nonce
+
+================================================================================
+4. KNOWN VULNERABILITIES AND PAST AUDITS
+================================================================================
+
+4.1 AUDIT FIRMS AND REPORTS
+-----------------------------
+
+Dedaub (May 2025) - DVN-AVS Contracts:
+  - 1 High, 1 Medium, 1 Low (all resolved)
+  - High: Admin could call slashOperator() directly bypassing security council
+  - Fix: Admin role removed entirely
+
+OtterSec (Sept 2022) - Aptos Bridge:
+  - 1 High, 7 Informational
+  - High: Bridge receive function susceptible to DoS (reverts caused
+    unprocessable packets, freezing bridge)
+
+OtterSec (Sept 2024) - WAB V2 (Wrapped Asset Bridge):
+  - General findings, future anti-pattern concerns
+
+ChainSecurity - OFT/OApp:
+  - "Satisfactory level of security"
+
+Zellic (May 2024, Sept 2025) - OApp & OFT:
+  - Security assessment, results not fully public
+
+Code4rena (2025) - Sui Endpoint V2:
+  - $103,000 reward pool, Sept 2025
+  - Known issue: malformed byte array keccak hash collision
+
+Code4rena (2025) - Starknet Endpoint:
+  - $100,000 reward pool, Oct 2025
+
+All reports: https://github.com/LayerZero-Labs/Audits
+
+4.2 JAMES PRESTWICH "ZEROVALIDATION" DISCLOSURE (Jan 2023)
+------------------------------------------------------------
+
+Two critical trusted-party vulnerabilities in V1:
+
+CRITICAL 1 - Fraudulent Message Delivery via Default Library Change:
+  - LayerZero MultiSig could change the default Receiving library
+  - This allows submitting arbitrary messages to default-configured apps
+  - Bypasses Oracle & Relayer 2-of-2 multisig entirely
+  - Impact: Theft of all user funds in default-configured apps
+
+CRITICAL 2 - Message Payload Modification:
+  - LayerZero MultiSig could modify message payloads during ULN processing
+  - Occurs AFTER Oracle and Relayer have signed off
+  - Exploits "drag-along" mechanism in upgrade system
+  - Impact: Theft of all user funds
+
+Prestwich claimed this was actively exploited on mainnet for Stargate.
+LayerZero CEO denied claims, but acknowledged:
+  - Default library pointer can be changed by team for default-configured apps
+  - Most projects were using defaults at the time
+  - Recommended apps set their own config rather than relying on defaults
+
+Status: V2 architecture redesigned to address these concerns via immutable
+Endpoint and append-only MessageLib registry. However, similar trust
+assumptions may exist in different forms.
+
+4.3 BOUNTY PAYOUTS
+--------------------
+Total paid to whitehats: ~$1,000,000 (as of program inception through present)
+No specific disclosed vulnerability details from bounty payouts are public.
+
+================================================================================
+5. SPECIFIC CONTRACTS AND FILES TO AUDIT
+================================================================================
+
+5.1 WHERE ecrecover / ECDSA IS USED
+-------------------------------------
+
+PRIMARY: MultiSig.sol
+  Path: packages/layerzero-v2/evm/messagelib/contracts/uln/dvn/MultiSig.sol
+  Uses: OpenZeppelin ECDSA.tryRecover()
+  Function: verifySignatures(bytes32 _hash, bytes calldata _signatures)
+  Called by: DVN.sol execute() and quorumChangeAdmin()
+
+SECONDARY: DVN.sol
+  Path: packages/layerzero-v2/evm/messagelib/contracts/uln/dvn/DVN.sol
+  Inherits MultiSig, uses verifySignatures for all quorum-gated operations
+
+V1 LEGACY: FPValidator.sol
+  Path: contracts/proof/FPValidator.sol (in LayerZero-v1 repo)
+  NOTE: FPValidator does NOT use ecrecover -- uses keccak256 hash comparison
+  V1 security relies on Oracle + Relayer 2-of-2 model
+
+NOT USED AT ULN LEVEL:
+  ReceiveUln302.verify() tracks msg.sender (DVN contract address), not sigs
+  The ULN protocol layer does NOT perform ECDSA verification directly
+
+5.2 CRYPTO LIBRARIES
+----------------------
+  - OpenZeppelin ECDSA (ECDSA.tryRecover) -- primary
+  - OpenZeppelin EnumerableSet -- signer management
+  - OpenZeppelin AccessControl -- role-based access
+  - No custom crypto implementations observed in open-source contracts
+
+5.3 KEY INTERFACES
+-------------------
+  - ILayerZeroDVN: assignJob(), getFee()
+  - IReceiveUlnE2: verify(bytes,bytes32,uint64) [selector: 0x0223536e]
+  - ILayerZeroEndpointV2: send(), lzReceive()
+  - ISendLib, IReceiveLib
+
+================================================================================
+6. ATTACK SURFACE ANALYSIS
+================================================================================
+
+6.1 SIGNATURE MALLEABILITY
+----------------------------
+
+Status: MITIGATED by OpenZeppelin ECDSA.tryRecover()
+
+OpenZeppelin's ECDSA library protects against EIP-2 signature malleability by:
+  - Enforcing s value in lower half of secp256k1 order
+  - Validating v is exactly 27 or 28
+  - Using tryRecover (returns error instead of reverting on failure)
+
+Residual risk: If any DVN adapter or custom implementation uses raw ecrecover()
+without OpenZeppelin, malleability could allow signature reuse.
+
+AUDIT FOCUS: Check DVN adapter contracts in
+packages/layerzero-v2/evm/messagelib/contracts/uln/dvn/adapters/
+for raw ecrecover usage.
+
+6.2 ecrecover RETURNING address(0)
+-------------------------------------
+
+Status: MITIGATED by ECDSA.tryRecover()
+
+ECDSA.tryRecover returns RecoverError.InvalidSignature if recovery yields
+address(0). The MultiSig contract uses tryRecover and checks for errors.
+
+Residual risk: Any contract that uses raw ecrecover without checking for
+address(0) return. If address(0) were somehow in the signer set, it could
+validate invalid signatures.
+
+AUDIT FOCUS:
+  - Verify address(0) is never added to signer set
+  - Check _setSigner() validates _signer != address(0)
+  - Check all DVN adapters for raw ecrecover usage
+
+6.3 MISSING LENGTH CHECKS ON SIGNATURE BYTES
+----------------------------------------------
+
+Status: CHECKED in MultiSig.sol
+
+MultiSig.verifySignatures requires: _signatures.length == quorum * 65
+This prevents:
+  - Undersized signature arrays (fewer sigs than quorum)
+  - Oversized arrays (extra data appended)
+  - Misaligned parsing
+
+Residual risk: If quorum is 0 (should be prevented by _setQuorum), length
+check passes with empty signatures.
+
+AUDIT FOCUS:
+  - Verify quorum > 0 is enforced at all paths
+  - Check if quorum can be set to 0 via any admin pathway
+  - Integer overflow: quorum * 65 for very large quorum values (uint64)
+
+6.4 REPLAY ATTACKS ACROSS CHAINS
+----------------------------------
+
+Status: PARTIALLY MITIGATED
+
+Protocol level:
+  - Nonce per channel (source/dest pair) prevents protocol-level replay
+  - GUID provides global uniqueness
+  - Exactly-once delivery with hash deletion after execution
+
+DVN level:
+  - hashCallData includes vid (DVN instance ID) -- prevents cross-DVN replay
+  - hashCallData includes target address
+  - usedHashes mapping prevents same-DVN replay
+  - Expiration timestamp provides time-bound validity
+
+RESIDUAL RISKS:
+  a) Cross-chain DVN replay: If vid is the same across chains for the same
+     DVN deployment, a signed execution on chain A could potentially be
+     replayed on chain B if the target address exists on both chains.
+     INVESTIGATE: Is vid unique per chain or per DVN instance?
+
+  b) verify() calls exempt from hash checking: DVN.sol optimization skips
+     usedHashes for "stateless" operations. Verify that verify() is truly
+     idempotent and that replaying it cannot cause harm.
+     "to save gas, we don't check hash for some functions"
+
+  c) Application-layer replay: LayerZero protocol guarantees exactly-once
+     delivery, but apps that process messages outside standard lzReceive
+     flow may lack replay protection. (Sherlock audit found this in a
+     lending protocol built on LayerZero.)
+
+6.5 NONCE HANDLING IN MULTI-SIG VERIFICATION
+----------------------------------------------
+
+The MultiSig.sol does NOT use nonces. Instead it uses:
+  - Hash-based replay protection (usedHashes mapping in DVN.sol)
+  - Expiration timestamps
+  - Ascending signer address ordering (prevents duplicate sigs, not replay)
+
+Potential issues:
+  a) No nonce means ordering of operations is not enforced within the
+     expiration window. Two valid signed operations could be executed in
+     any order.
+
+  b) If an execution reverts, the hash is UNMARKED (allowing retry).
+     This is intentional but creates a window where a previously-failed
+     transaction could be retried by anyone with ADMIN_ROLE after
+     conditions change.
+
+  c) Expiration check: verify the expiration comparison is strict
+     (block.timestamp < expiration, not <=). Off-by-one in expiration
+     could extend execution window.
+
+6.6 ADDITIONAL ATTACK VECTORS
+-------------------------------
+
+a) DVN Collusion / Compromise:
+   - If all required DVNs for an OApp are compromised, arbitrary messages
+     can be verified. This is by design (security = union of DVN trust).
+   - Investigate: Can a compromised DVN call verify() for packets that
+     were never sent? (Answer: Yes, if the DVN contract calls
+     ReceiveUln302.verify with arbitrary data)
+   - Mitigation: nilify() function can nullify verified packets
+
+b) commitVerification permissionless call:
+   - Anyone can call commitVerification once DVN quorum is met
+   - Could this be front-run or used to commit at an unfavorable time?
+
+c) Role escalation in DVN.sol:
+   - quorumChangeAdmin requires only MultiSig quorum (not full execute flow)
+   - If quorum is compromised, admin can be changed
+   - Admin can then do: setDstConfig, withdrawFees, execute, grantRole
+   - Could lead to DVN takeover
+
+d) Fee manipulation:
+   - DVNFeeLib computes fees. If fee calculation is manipulable, DVN
+     could be drained or messages could be verified for free.
+
+e) TON/Solana/Aptos specific:
+   - Different runtime environments may have different signature
+     verification characteristics
+   - TON Controller/ULNManager/DVNProxy are in scope but less audited
+
+f) MessageLib upgrade path:
+   - V2 uses append-only registry (unlike V1's replaceable default)
+   - But: What happens if a new malicious MessageLib is registered?
+   - OApps must explicitly opt-in, but verify the opt-in mechanism
+
+g) Lazy nonce gap exploitation:
+   - Messages can be verified out of order but execute sequentially
+   - Can a blocked message at nonce N prevent all subsequent messages?
+   - This is acknowledged as a design feature (lossless delivery)
+   - But: Could an attacker intentionally block a nonce to freeze a channel?
+
+================================================================================
+7. PRIORITY AUDIT TARGETS
+================================================================================
+
+HIGH PRIORITY (Signature Verification):
+  1. MultiSig.sol -- verifySignatures() -- core ECDSA logic
+  2. DVN.sol -- execute() -- replay protection, hash computation, execution
+  3. DVN.sol -- quorumChangeAdmin() -- role escalation via multisig
+  4. DVN adapters (adapters/ directory) -- custom verification logic
+
+HIGH PRIORITY (Protocol Core):
+  5. ReceiveUln302.sol -- verify(), commitVerification(), _verifyAndReclaimStorage()
+  6. EndpointV2.sol -- message delivery, nonce handling
+  7. UlnBase.sol -- UlnConfig validation, DVN quorum logic
+
+MEDIUM PRIORITY (Token Standards):
+  8. OFT contracts -- cross-chain token minting/burning
+  9. OApp.sol -- lzReceive() message handling
+
+MEDIUM PRIORITY (Legacy V1):
+  10. UltraLightNodeV2.sol -- validateTransactions()
+  11. FPValidator.sol -- validateProof() hash comparison
+
+LOWER PRIORITY (Specific Chains):
+  12. Solana programs -- DVN, SendULN302, ReceiveULN302
+  13. TON contracts -- Controller, ULNManager, DVNProxy
+
+================================================================================
+8. RECOMMENDED NEXT STEPS
+================================================================================
+
+1. Clone LayerZero-v2 repo and perform static analysis on MultiSig.sol
+   and DVN.sol with focus on:
+   - ECDSA.tryRecover error handling paths
+   - Integer overflow in quorum * 65
+   - Signer set management edge cases
+   - usedHashes bypass in _shouldCheckHash
+
+2. Review DVN adapter contracts for non-standard signature verification
+
+3. Analyze ReceiveUln302 for:
+   - commitVerification race conditions
+   - DVN impersonation possibilities
+   - Config manipulation during verification
+
+4. Review cross-chain nonce/GUID handling for replay vectors
+
+5. Check TON/Solana implementations for equivalent security guarantees
+
+6. Review Code4rena Sui/Starknet audit results when published
+
+7. Test: Can vid collision between DVN instances enable cross-instance replay?
+
+8. Test: What happens when quorum changes mid-verification (signers added/
+   removed while signed transactions are pending)?
+
+================================================================================
+END OF REPORT
+================================================================================

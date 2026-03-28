@@ -1,0 +1,632 @@
+================================================================================
+FIREDANCER CRYPTOGRAPHIC VULNERABILITY RECONNAISSANCE REPORT
+================================================================================
+Target: Firedancer (Jump Crypto's Solana Validator in C)
+Repository: https://github.com/firedancer-io/firedancer
+Bounty: $100K-$500K (Critical) on Immunefi
+Date: 2026-03-27
+================================================================================
+
+TABLE OF CONTENTS
+-----------------
+1. Bounty Scope Summary
+2. Prior Audits & Known Issues
+3. Cryptographic Code Map
+4. Ed25519 Implementation Analysis
+5. Field Arithmetic Analysis
+6. Scalar Operations Analysis
+7. Non-Canonical Point Handling (HIGH PRIORITY)
+8. Batch Verification Discrepancies (HIGH PRIORITY)
+9. Side-Channel Vulnerability Analysis
+10. secp256k1 / secp256r1 Analysis
+11. BN254 / BLS12-381 / ZK SDK
+12. Precompile Integration Analysis
+13. Attack Vectors & Recommended Deep-Dives
+14. Testing Coverage Gaps
+
+================================================================================
+1. BOUNTY SCOPE SUMMARY
+================================================================================
+
+Program: Firedancer on Immunefi
+  - Live since: Sep 18, 2024
+  - Last updated: Jan 28, 2026
+  - Rewards: Critical $100K-$500K, High $50K-$100K, Medium $5K-$50K
+  - PoC required, KYC required
+  - Payments in USDC
+  - Primacy of Rules model
+
+In Scope:
+  - ALL code linked/reachable by the fdctl binary main function
+  - The fdctl run command and configure, monitor, etc.
+  - Firedancer v0.1 sandbox and machine model (can assume tile breach)
+  - FFI interface between Firedancer and Agave
+  - Bugs in linked-but-unreachable code = informational only
+
+Out of Scope:
+  - Bugs in Agave validator itself (report to Agave bounty instead)
+
+Sources:
+  - https://immunefi.com/bug-bounty/firedancer/information/
+  - https://immunefi.com/audit-competition/firedancer-boost/resources/
+
+================================================================================
+2. PRIOR AUDITS & KNOWN ISSUES
+================================================================================
+
+Neodyme Audit v0.1 (2024):
+  - Comprehensive threat modeling and architectural analysis
+  - No RCE found; mostly DoS in QUIC stack
+
+Neodyme Audit v0.4 (Feb-Mar 2025):
+  - 5 senior security researchers
+  - No RCE found
+  - 1 HIGH: unintuitive Agave feature activation
+  - Most findings: DoS in QUIC networking stack
+  - Audit report: https://neodyme.io/reports/Firedancer-v0.4.pdf
+
+Immunefi Audit Contest (Jul-Aug 2024):
+  - Community audit contest leading to mainnet launch
+
+Key Insight: Prior audits focused on QUIC/networking. The CRYPTOGRAPHIC
+IMPLEMENTATION has received LESS scrutiny. This is our target.
+
+Sources:
+  - https://github.com/firedancer-io/firedancer/blob/main/SECURITY.md
+  - https://github.com/firedancer-io/firedancer/security
+
+================================================================================
+3. CRYPTOGRAPHIC CODE MAP
+================================================================================
+
+All crypto lives under: src/ballet/
+
+Core Ed25519 (PRIMARY TARGET):
+  src/ballet/ed25519/fd_ed25519.h              - Public API
+  src/ballet/ed25519/fd_ed25519_user.c         - Sign/Verify/Batch verify
+  src/ballet/ed25519/fd_curve25519.c           - Curve operations (scalar mul, MSM)
+  src/ballet/ed25519/fd_curve25519.h           - Curve API
+  src/ballet/ed25519/fd_curve25519_scalar.h    - Scalar arithmetic (validate, reduce, muladd)
+  src/ballet/ed25519/fd_curve25519_scalar.c    - Scalar reduce implementation (Barrett)
+  src/ballet/ed25519/fd_curve25519_secure.c    - Const-time operations
+  src/ballet/ed25519/fd_f25519.h               - Field element API
+  src/ballet/ed25519/fd_ristretto255.c         - Ristretto255 encoding
+
+Architecture-specific implementations:
+  src/ballet/ed25519/ref/                      - Reference (portable) implementation
+  src/ballet/ed25519/avx512/                   - AVX-512 optimized (production path)
+  src/ballet/ed25519/table/                    - Precomputed tables
+
+Field arithmetic backends:
+  src/ballet/fiat-crypto/curve25519_64.c       - Fiat-crypto generated (64-bit)
+  src/ballet/fiat-crypto/curve25519_32.c       - Fiat-crypto generated (32-bit)
+  src/ballet/fiat-crypto/curve25519_scalar_64.c - Scalar field
+
+Other crypto:
+  src/ballet/secp256k1/                        - secp256k1 (uses s2n-bignum)
+  src/ballet/secp256r1/                        - secp256r1 (NIST P-256)
+  src/ballet/bn254/                            - BN254 pairing + Poseidon
+  src/ballet/bls/                              - BLS12-381
+  src/ballet/sha256/                           - SHA-256 (inc. AVX batch)
+  src/ballet/sha512/                           - SHA-512
+  src/ballet/keccak256/                        - Keccak
+  src/ballet/aes/                              - AES
+  src/ballet/chacha/                           - ChaCha20
+  src/ballet/hmac/                             - HMAC
+  src/ballet/x509/                             - X.509 (TLS)
+  src/ballet/zksdk/                            - ZK proof verification SDK
+  src/ballet/sbpf/                             - SBF/BPF program loader
+
+Hardware implementations:
+  src/wiredancer/                              - FPGA/RTL Ed25519 (SystemVerilog)
+
+Precompile integration:
+  src/flamenco/runtime/program/fd_precompiles.c - Ed25519/secp256k1/secp256r1 precompiles
+
+Verify tile:
+  src/disco/verify/fd_verify_tile.h            - Batch sig verification tile
+
+================================================================================
+4. ED25519 IMPLEMENTATION ANALYSIS
+================================================================================
+
+FINDING F-01: NON-CANONICAL POINT ACCEPTANCE (MEDIUM-HIGH RISK)
+---------------------------------------------------------------
+File: src/ballet/ed25519/fd_ed25519_user.c, lines 166-190
+
+The verify function explicitly ACCEPTS non-canonical points for both the
+public key (A) and the signature component (R). The code comments at line
+171-190 discuss this:
+
+  "There's another check that we currently do NOT enforce:
+   whether public key and point r are canonical."
+
+The code has a COMMENTED-OUT canonical check (lines 185-189):
+  // uchar compressed[ 32 ];
+  // fd_ed25519_affine_tobytes( compressed, R );
+  // if( FD_UNLIKELY( !fd_memeq( compressed, r, 32 ) ) ) {
+  //   return FD_ED25519_ERR_SIG;
+  // }
+
+They note at line 174: "Dalek 2.x (currently used by Agave) does NOT do
+any check. Dalek 4.x checks that the point r is canonical."
+
+ATTACK SURFACE: If Agave upgrades to Dalek 4.x, there could be a
+consensus split between Firedancer and Agave on canonical point handling.
+This is a TICKING TIME BOMB. When Agave upgrades dalek, Firedancer must
+match or face consensus disagreement.
+
+Additionally, the point comparison at line 226 uses fd_ed25519_point_eq_z1()
+instead of compressing and comparing bytes. The comment at lines 219-225
+notes this "implicitly prevents non-canonical R" in OTHER implementations
+but NOT in Firedancer's approach of comparing points directly.
+
+FINDING F-02: SMALL ORDER POINT REJECTION PATTERN (MEDIUM RISK)
+----------------------------------------------------------------
+File: src/ballet/ed25519/fd_curve25519.h, lines 87-118
+
+The fd_ed25519_affine_is_small_order() function checks for all 8 small
+order points by checking:
+  - X == 0
+  - Y == 0
+  - Y == specific order-8 Y coordinates
+
+This check REQUIRES the point to be affine (Z==1). The comment at line 110
+says: "if the point is not affine, we could do 1 single dbl and check for
+X==0 or Y==0 (currently not implemented as not needed)."
+
+If ANY code path calls this with a non-affine point, the check FAILS
+SILENTLY. All decompressed points are affine (Z=1 by construction in
+fd_ed25519_point_frombytes), but this is a fragile invariant.
+
+FINDING F-03: VERIFY SKIPS COFACTOR MULTIPLICATION (BY DESIGN)
+--------------------------------------------------------------
+File: src/ballet/ed25519/fd_ed25519_user.c, lines 209-217
+
+The verify uses [S]B = R + [k]A' (without cofactor 8), which is the
+"verify_strict" behavior. Solana uses this intentionally. But the
+implementation rejects small-order A and R explicitly (lines 194-199),
+which is how Solana enforces this.
+
+The key question: does this EXACTLY match Agave's behavior for ALL inputs?
+The differential fuzzer (fuzz_ed25519_sigverify_diff.c) tests against
+Dalek, but coverage quality is unknown.
+
+FINDING F-04: BATCH VERIFY VS SINGLE VERIFY CONSISTENCY (HIGH PRIORITY)
+------------------------------------------------------------------------
+File: src/ballet/ed25519/fd_ed25519_user.c, lines 232-310
+
+fd_ed25519_verify_batch_single_msg performs batch verification. It does
+the SAME checks as single verify (scalar validate, decompress, small order
+check, compute k, double scalar mul, point compare).
+
+HOWEVER, the batch function processes a single message with MULTIPLE
+signatures/pubkeys. It's used by the verify tile for performance. Any
+difference in accept/reject behavior between batch and single verify
+could cause consensus issues.
+
+The batch is capped at MAX=16 (line 238). The batch does NOT use random
+linear combination (which is the standard approach for batch Ed25519
+verification). Instead, it individually verifies each signature in the batch.
+This means it's a "batch" only in terms of shared message hashing, not in
+the cryptographic batch verification sense.
+
+This is SAFE but SLOW. The verify tile at:
+  src/disco/verify/fd_verify_tile.h:91
+calls fd_ed25519_verify_batch_single_msg for transaction signatures.
+
+================================================================================
+5. FIELD ARITHMETIC ANALYSIS
+================================================================================
+
+FINDING F-05: FIAT-CRYPTO GENERATED CODE (LOW RISK)
+----------------------------------------------------
+The field arithmetic uses fiat-crypto generated code:
+  src/ballet/fiat-crypto/curve25519_64.c
+
+Fiat-crypto is formally verified, so the core field operations (mul, sqr,
+add, sub, carry) should be correct. This significantly reduces the risk
+of field arithmetic bugs.
+
+The field element representation:
+  - 64-bit mode: 5 limbs of ulong (51-bit limbs)
+  - 32-bit mode: 10 limbs of uint (25.5-bit limbs)
+
+fd_f25519_is_zero() checks both the zero representation AND the
+alternative representation (p itself, since 0 == p mod p). This is
+correct for the fiat-crypto representation.
+
+FINDING F-06: add_nr / sub_nr WITHOUT REDUCTION (LOW-MEDIUM RISK)
+-----------------------------------------------------------------
+File: src/ballet/ed25519/ref/fd_f25519.c, lines 73-90
+
+fd_f25519_add_nr and fd_f25519_sub_nr do NOT reduce mod p. The comments
+say "It can be used before mul, sqr." These unreduced values are used
+extensively in the point addition formulas.
+
+If an unreduced value is accidentally used where a reduced value is
+expected (e.g., in comparisons or serialization), it could cause
+incorrect results. The code carefully uses reduced operations where
+needed (e.g., fd_ed25519_partial_dbl at lines 203-205 in
+ref/fd_curve25519.h comments "important: reduce mod p").
+
+================================================================================
+6. SCALAR OPERATIONS ANALYSIS
+================================================================================
+
+FINDING F-07: SCALAR VALIDATE TIMING LEAK (LOW RISK FOR VERIFY)
+----------------------------------------------------------------
+File: src/ballet/ed25519/fd_curve25519_scalar.h, lines 58-87
+
+fd_curve25519_scalar_validate() is explicitly NOT constant-time:
+  "Not constant time and thus should not be exposed to secrets."
+
+This is used in verify (on the signature's S component), which is public
+data, so this is fine. But if it were ever used on secret scalars, it
+would leak information.
+
+FINDING F-08: SCALAR REDUCE (BARRETT REDUCTION) CORRECTNESS
+------------------------------------------------------------
+File: src/ballet/ed25519/fd_curve25519_scalar.c
+
+The scalar reduce uses the classic Ed25519 reduction with 21-bit limbs
+and the specific constants (666643, 470296, 654183, 997805, 136657, 683901).
+This is identical to the reference implementation from SUPERCOP/ref10.
+
+The reduction does TWO rounds of Barrett reduction (lines 33-38 for
+high limbs, then 53-58 for mid limbs, then final carry chain).
+
+This is a well-tested pattern. Low likelihood of bugs here, but the
+large amount of manual arithmetic is still worth reviewing for off-by-one
+in the carry chain.
+
+FINDING F-09: SCALAR INVERSE BY EXPONENTIATION (LOW RISK)
+----------------------------------------------------------
+File: src/ballet/ed25519/fd_curve25519_scalar.h, lines 153-178
+
+fd_curve25519_scalar_inv uses exponentiation by l-2, iterating through
+bits of l-1 (the group order minus one). This is standard Fermat's little
+theorem. The implementation manually handles bits 0-2 (since -2 and -1
+differ there), then uses the bits of -1 from bit 3 to 252.
+
+This is NOT constant-time (it branches on bits of l-2, but l-2 is a
+public constant, so this is fine).
+
+================================================================================
+7. NON-CANONICAL POINT HANDLING (HIGH PRIORITY)
+================================================================================
+
+FINDING F-10: FROMBYTES ACCEPTS NON-CANONICAL Y COORDINATES (CRITICAL PATH)
+----------------------------------------------------------------------------
+File: src/ballet/ed25519/fd_curve25519.c, line 36-61
+File: src/ballet/ed25519/fd_f25519.h, lines 95-101
+
+fd_ed25519_point_frombytes calls fd_f25519_frombytes which uses
+fiat_25519_from_bytes. The comment says "we accept non-canonical elements
+unlike RFC 8032." This means Y coordinates >= p are accepted.
+
+A Y coordinate of p+k for small k maps to the same field element as k,
+but the 32-byte encoding is DIFFERENT. This means:
+  1. Two different byte strings can decode to the same point
+  2. If verify compares decompressed points (which it does), both
+     encodings will verify the same
+
+The current verify at fd_ed25519_user.c:226 compares decompressed points
+using fd_ed25519_point_eq_z1(). This means non-canonical R values would
+PASS verification (same point, different encoding).
+
+CRITICAL QUESTION: Does Agave accept or reject non-canonical R and A?
+If they differ, this is a CONSENSUS BUG worth $500K.
+
+The code comment at line 183 says "we can add it in when Agave switches
+to dalek 4.x" -- this suggests the developers KNOW about this discrepancy
+but haven't addressed it yet.
+
+FINDING F-11: TOBYTES ALWAYS PRODUCES CANONICAL OUTPUT
+------------------------------------------------------
+File: src/ballet/ed25519/fd_f25519.h, lines 103-109
+
+fd_f25519_tobytes uses fiat_25519_to_bytes which always reduces mod p.
+This means round-trip (frombytes -> tobytes) can change the encoding.
+
+================================================================================
+8. BATCH VERIFICATION DISCREPANCIES (HIGH PRIORITY)
+================================================================================
+
+FINDING F-12: VERIFY TILE BATCH PATH
+-------------------------------------
+File: src/disco/verify/fd_verify_tile.h:91
+
+The verify tile calls fd_ed25519_verify_batch_single_msg, which verifies
+multiple signatures over the SAME message. This is used for transaction
+signature verification.
+
+If ANY signature in the batch fails, the ENTIRE batch is rejected. This
+means a single bad signature can cause valid transactions to be rejected
+in the same batch. This is by design (Solana requires ALL transaction
+signatures to be valid), but worth understanding.
+
+FINDING F-13: SHRED VERIFICATION (SINGLE PATH)
+-----------------------------------------------
+File: src/disco/shred/fd_fec_resolver.c:657
+
+Shred verification uses single fd_ed25519_verify, not batch. This is a
+different code path. Any bug that only manifests in single verify but
+not batch (or vice versa) could cause selective acceptance of shreds.
+
+================================================================================
+9. SIDE-CHANNEL VULNERABILITY ANALYSIS
+================================================================================
+
+FINDING F-14: SIGN IS CONSTANT-TIME (GOOD)
+-------------------------------------------
+fd_ed25519_scalar_mul_base_const_time is used for signing. It:
+  - Uses radix-16 decomposition
+  - Uses constant-time table lookup (fd_ed25519_table_select)
+  - Uses fd_ed25519_point_add_secure (no temp var leaks)
+  - Sanitizes all secret data before return
+  - Marked FD_FN_SENSITIVE (clears registers)
+
+FINDING F-15: VERIFY IS NOT CONSTANT-TIME (EXPECTED)
+-----------------------------------------------------
+Verify operations use variable-time code (wNAF scalar multiplication,
+early returns on validation failures). This is standard practice as
+verify inputs are public.
+
+FINDING F-16: CONSTANT-TIME TABLE SELECT (GOOD)
+------------------------------------------------
+File: src/ballet/ed25519/fd_curve25519_secure.c, lines 43-92
+
+const_time_eq and fd_ed25519_table_select use constant-time operations.
+The select iterates through ALL 8 table entries regardless of the actual
+index, using conditional moves.
+
+POTENTIAL ISSUE: The fd_ed25519_point_if function at ref/fd_curve25519_secure.c
+line 130-138 explicitly does NOT copy Z: "we explicitly don't copy Z because
+this function is only used by fd_ed25519_table_select()". This is correct
+for the current use but is a footgun if the function is reused elsewhere.
+
+================================================================================
+10. SECP256K1 / SECP256R1 ANALYSIS
+================================================================================
+
+FINDING F-17: SECP256K1 USES S2N-BIGNUM (GOOD)
+------------------------------------------------
+File: src/ballet/secp256k1/fd_secp256k1_private.h
+
+The secp256k1 implementation uses s2n-bignum for field arithmetic, which
+is formally verified assembly code from AWS. This significantly reduces
+the risk of arithmetic bugs.
+
+The recover function properly validates:
+  - recovery_id in [0,3]
+  - r and s are valid scalars
+  - p-n comparison for recovery_id & 2
+
+FINDING F-18: SECP256K1 MESSAGE SCALAR UNCONDITIONAL REDUCTION
+--------------------------------------------------------------
+File: src/ballet/secp256k1/fd_secp256k1.c, line 72
+
+The message hash is unconditionally reduced to the scalar field:
+  bignum_mod_n256k1_4( msg->limbs, (ulong *)msg->limbs );
+
+This matches Bitcoin's behavior (reference link in code).
+
+================================================================================
+11. BN254 / BLS12-381 / ZK SDK
+================================================================================
+
+These are newer additions and potentially less tested:
+
+BN254 (src/ballet/bn254/):
+  - Full pairing implementation
+  - Field extensions (Fp2, Fp6, Fp12)
+  - GLV endomorphism for scalar multiplication
+  - Poseidon hash function
+  - Used by the ZK SDK for confidential transfers
+
+BLS12-381 (src/ballet/bls/):
+  - Single file implementation
+  - Used for consensus signatures potentially
+
+ZK SDK (src/ballet/zksdk/):
+  - Range proofs
+  - Transcript management
+  - Instructions for confidential transfers
+
+These are HIGH VALUE targets because:
+  1. Complex math (pairing, field towers)
+  2. Newer code (less battle-tested)
+  3. Directly handles user funds (confidential transfers)
+
+================================================================================
+12. PRECOMPILE INTEGRATION ANALYSIS
+================================================================================
+
+FINDING F-19: PRECOMPILE OFFSET PARSING (MEDIUM RISK)
+------------------------------------------------------
+File: src/flamenco/runtime/program/fd_precompiles.c
+
+The Ed25519 precompile reads signature offsets from transaction data.
+The offset structure is packed (14 bytes):
+  struct fd_precompile_sig_offsets {
+    ushort sig_offset;
+    ushort sig_instr_idx;
+    ushort pubkey_offset;
+    ushort pubkey_instr_idx;
+    ushort msg_offset;
+    ushort msg_data_sz;
+    ushort msg_instr_idx;
+  };
+
+POTENTIAL ISSUE: The code casts raw transaction data to this struct:
+  fd_ed25519_signature_offsets_t const * sigoffs =
+    (const fd_ed25519_signature_offsets_t *) (data + off);
+
+On architectures with strict alignment requirements, this could be
+problematic. On x86 it works due to unaligned access support.
+
+FINDING F-20: EDGE CASE IN ED25519 PRECOMPILE
+----------------------------------------------
+File: src/flamenco/runtime/program/fd_precompiles.c, lines 139-145
+
+Special case handling: data_sz == 2 && data[0] == 0 returns SUCCESS.
+This matches Agave behavior but is "really silly" (their own comment).
+The separate edge case of sig_cnt == 0 (line 148) returns an error.
+
+The Secp256k1 precompile has a different special case: data_sz == 1 &&
+data[0] == 0 (1 byte, not 2). Different precompiles have different
+edge cases, which is a source of bugs.
+
+FINDING F-21: ERROR CODE DIVERGENCE FROM AGAVE
+-----------------------------------------------
+Lines 182-183 and 197-199 note: "the return error code might be different
+from Agave in some edge cases" because Firedancer parses signatures and
+public keys as part of fd_ed25519_verify, while Agave does separate
+parsing and validation.
+
+If error codes affect transaction processing differently, this could be
+a consensus divergence. However, both should ultimately accept/reject the
+same set of valid signatures.
+
+================================================================================
+13. ATTACK VECTORS & RECOMMENDED DEEP-DIVES
+================================================================================
+
+PRIORITY 1 (CRITICAL - Consensus Bugs):
+-----------------------------------------
+A. Non-canonical point acceptance divergence:
+   Firedancer accepts non-canonical R and A in verify.
+   If Agave rejects them (or will reject after Dalek upgrade), craft a
+   transaction with non-canonical R that Firedancer accepts but Agave
+   rejects (or vice versa). This would be a consensus split = $500K.
+
+   HOW TO TEST:
+   1. Take valid sig (R, S) for pubkey A over msg M
+   2. Add p to R's Y coordinate to get non-canonical R' encoding
+   3. Submit to both Firedancer and Agave
+   4. If they differ: consensus bug
+
+B. Point comparison method divergence:
+   Firedancer compares decompressed points (eq_z1), most other
+   implementations compress and compare bytes. If there exist
+   two different extended coordinates that compare equal via eq_z1
+   but produce different compressed forms, this is a bug.
+
+   HOW TO TEST:
+   1. Find a non-canonical R encoding that decompresses to a valid point
+   2. Verify the same signature with canonical and non-canonical R
+   3. Check if both produce same result in Firedancer vs Agave
+
+C. Batch vs single verification divergence:
+   Craft a signature that passes single verify but fails batch verify
+   (or vice versa). Any such input is a potential consensus bug.
+
+PRIORITY 2 (HIGH - $100K+):
+-----------------------------
+D. AVX512 vs Reference implementation divergence:
+   The AVX512 and reference implementations use completely different
+   data types (r43x6 vs fiat-crypto limbs). Differential fuzzing between
+   them could reveal discrepancies on edge cases.
+
+E. BN254 pairing bugs:
+   The BN254 pairing is complex math. Off-by-one in the Miller loop,
+   incorrect final exponentiation, or wrong twist could cause the ZK SDK
+   to accept invalid proofs, enabling theft of confidential transfer funds.
+
+F. Ristretto255 encoding bugs:
+   The ristretto255 implementation has many steps (sqrt_ratio, abs, etc.)
+   where an incorrect sign or conditional could cause invalid points to
+   be accepted.
+
+PRIORITY 3 (MEDIUM - $5K-$50K):
+---------------------------------
+G. SHA-512 batch AVX implementation:
+   The SHA-512 batch implementations (AVX, AVX512) process multiple
+   hashes in parallel. Any divergence from the reference implementation
+   on edge cases (empty message, very long message) is a bug.
+
+H. SBF/BPF loader vulnerabilities:
+   The SBPF loader in src/ballet/sbpf/ parses ELF files and validates
+   SBF programs. Memory corruption bugs in the parser could allow
+   code execution.
+
+I. X.509 / TLS implementation:
+   Custom TLS implementation could have certificate validation bugs.
+
+================================================================================
+14. TESTING COVERAGE GAPS
+================================================================================
+
+What's well-tested:
+  - Ed25519 sign/verify (Wycheproof vectors, signature malleability tests)
+  - Differential fuzzing against Dalek (fuzz_ed25519_sigverify_diff.c)
+  - SHA-256/SHA-512 test vectors
+
+What needs MORE testing:
+  - Non-canonical point edge cases (the developers admit at line 177-180
+    they couldn't find test vectors for non-canonical-only cases)
+  - BN254 pairing corner cases
+  - Ristretto255 edge cases
+  - AVX512 <-> reference implementation cross-validation
+  - secp256r1 (newer, less tested precompile)
+  - Precompile error code matching with Agave
+
+================================================================================
+WHY FIREDANCER IS A STRONG TARGET FOR US
+================================================================================
+
+1. WRITTEN IN C: Our CUDA/C expertise applies directly. No Solidity needed.
+
+2. COMPLEX CRYPTO FROM SCRATCH: They reimplemented Ed25519, secp256k1,
+   BN254 pairing, etc. in C. Despite using fiat-crypto for field ops,
+   the higher-level operations (point addition, scalar multiplication,
+   signature verification) are custom.
+
+3. MULTIPLE IMPLEMENTATIONS: ref vs avx512 is a prime differential testing
+   target. Any discrepancy is a bug.
+
+4. CONSENSUS-CRITICAL: As an alternative Solana validator, ANY behavioral
+   difference from Agave is potentially a $500K consensus bug.
+
+5. NON-CANONICAL HANDLING IS INCOMPLETE: The developers explicitly document
+   that canonical checks are missing (waiting for Agave to upgrade Dalek).
+   This is a known weak spot.
+
+6. LESS CRYPTO SCRUTINY: Prior audits (Neodyme) focused on QUIC networking.
+   The crypto code has been fuzzed but the coverage is uncertain.
+
+================================================================================
+NEXT STEPS
+================================================================================
+
+1. Set up differential testing environment:
+   - Build Firedancer's Ed25519 verify as a standalone test
+   - Compare against Dalek 2.x AND Dalek 4.x
+   - Focus on non-canonical inputs
+
+2. Generate non-canonical test vectors:
+   - Non-canonical Y (Y >= p but Y mod p is valid)
+   - Non-canonical R in signatures
+   - Non-canonical public keys
+   - Mixed canonical/non-canonical in batch
+
+3. Review the BN254 pairing:
+   - Miller loop implementation
+   - Final exponentiation
+   - Subgroup checks
+   - Twist security
+
+4. Review the AVX512 implementation in detail:
+   - fd_r43x6.h contains the core AVX512 field arithmetic
+   - Overflow bounds analysis for 43-bit limbs
+   - Cross-validate with reference for all precomputed tables
+
+5. Review SBF loader for memory safety:
+   - ELF parsing in fd_sbpf_loader.c
+   - Bounds checks on section headers
+   - Integer overflow in size calculations
+
+================================================================================
+END OF REPORT
+================================================================================

@@ -1,0 +1,746 @@
+================================================================================
+FIREDANCER vs AGAVE: Ed25519 VERIFICATION RESEARCH
+Consensus-Splitting Bug Analysis for Solana Bug Bounty
+================================================================================
+Date: 2026-03-27
+Scope: Ed25519 signature verification differences between Firedancer (C/AVX512)
+       and Agave (Rust/ed25519-dalek) that could cause consensus splits.
+
+================================================================================
+TABLE OF CONTENTS
+================================================================================
+1. ZIP-215 Specification
+2. Solana's Ed25519 Implementation (Agave)
+3. Firedancer's Ed25519 Implementation
+4. TWO Verification Paths in Solana (Critical!)
+5. Known Ed25519 Consensus Problem
+6. ed25519-dalek verify vs verify_strict (Critical!)
+7. Specific Edge Cases for Testing
+8. Cofactor Handling (h=8)
+9. Non-Canonical Encodings
+10. Small-Order Points
+11. Active SIMDs (Solana Improvement Documents)
+12. Test Vector Sources
+13. Previous Consensus Bugs in Other Chains
+14. Attack Scenarios
+15. Specific Hypotheses for Consensus-Splitting Bugs
+
+================================================================================
+1. ZIP-215 SPECIFICATION
+================================================================================
+
+Source: https://zips.z.cash/zip-0215
+Author: Henry de Valence (Penumbra/Zcash Foundation)
+
+ZIP-215 defines PRECISE validation rules for Ed25519 in consensus-critical
+contexts. The rules are:
+
+  RULE 1 (Point Encoding - A and R):
+    A and R MUST be encodings of points on the complete twisted Edwards curve
+    Ed25519. HOWEVER, non-canonical encodings ARE ALLOWED. The y-coordinate
+    integer need NOT be reduced modulo p = 2^255 - 19.
+
+  RULE 2 (Scalar - S):
+    S MUST represent an integer S less than L (the curve order,
+    L = 2^252 + 27742317777372353535851937790883648493).
+    This is the "canonical S" check.
+
+  RULE 3 (Verification Equation):
+    MUST use cofactored equation: [8][S]B = [8]R + [8][k]A
+    The alternate cofactorless equation [S]B = R + [k]A is PROHIBITED.
+
+KEY DIFFERENCES FROM RFC 8032:
+  - RFC 8032 REQUIRES canonical point encodings; ZIP-215 does NOT
+  - RFC 8032 allows EITHER cofactored or cofactorless; ZIP-215 REQUIRES cofactored
+  - RFC 8032 requires S < L; ZIP-215 also requires S < L (same)
+  - RFC 8032 is incompatible with virtually every tested implementation
+
+WHY ZIP-215 EXISTS:
+  The Zcash project discovered that libsodium (their Ed25519 library) changed
+  validation criteria between point releases (1.0.15 vs 1.0.16), breaking
+  consensus. When Zebra (alternative Zcash client in Rust) tried to match
+  zcashd behavior, the first attempt was ALSO incompatible because it matched
+  the wrong compile-time configuration of libsodium. ZIP-215 was created to
+  define explicit, unambiguous rules.
+
+IMPORTANT: Solana does NOT currently use ZIP-215. Solana uses ed25519-dalek's
+verify_strict, which has DIFFERENT rules. See sections 2 and 6.
+
+================================================================================
+2. SOLANA'S ED25519 IMPLEMENTATION (AGAVE)
+================================================================================
+
+Agave (the Anza/Solana Labs validator client in Rust) has TWO distinct
+Ed25519 verification paths:
+
+PATH 1: Transaction SigVerify (Runtime)
+  - Verifies transaction signatures (fee payer, required signers)
+  - Happens in the sigverify stage BEFORE execution
+  - Source: agave/perf/src/sigverify.rs
+  - Uses ed25519-dalek for verification
+  - Called via: ed25519_verify_cpu() or GPU-offloaded equivalent
+  - Parallelized: batches of VERIFY_PACKET_CHUNK_SIZE (128)
+
+PATH 2: Ed25519 Precompile Program (Ed25519SigVerify111111111111111111111111111)
+  - Verifies arbitrary Ed25519 signatures embedded in instruction data
+  - Source: sdk/src/ed25519_instruction.rs
+  - Used by programs that need to verify off-chain signatures
+  - Cannot be called via CPI; must be a top-level instruction
+  - Initially used verify(), then switched to verify_strict via feature gate
+
+LIBRARY VERSIONS:
+  - ed25519-dalek: pinned to exactly =1.0.1
+  - solana-ed25519-dalek: v0.2.0 (Solana-specific fork)
+  - curve25519-dalek: upgraded to v4.x in Agave v2.1
+
+FEATURE GATE (CRITICAL):
+  Feature: ed9tNscbWLYBooxWA7FE2B5KHWs8A6sxfY8EzezEcoo
+  Description: "Use verify_strict for signature verification in ed25519 precompile"
+  Author: samkim-crypto
+  Activated: epoch 681, version v2.0.4
+
+  Before this feature gate: Ed25519 precompile used verify() (more permissive)
+  After this feature gate:  Ed25519 precompile uses verify_strict() (stricter)
+
+  This means the Ed25519 PRECOMPILE and the transaction SIGVERIFY may use
+  DIFFERENT verification functions, or the feature gate unified them.
+  This is a critical area to investigate.
+
+================================================================================
+3. FIREDANCER'S ED25519 IMPLEMENTATION
+================================================================================
+
+Source: https://github.com/firedancer-io/firedancer
+Path: src/ballet/ed25519/
+
+Firedancer implements Ed25519 from scratch in C with AVX512 optimizations.
+It does NOT use ed25519-dalek, ed25519-zebra, or any Rust library.
+
+KEY IMPLEMENTATION DETAILS:
+  - Custom AVX512 vectorized implementation
+  - Uses radix-2^43 representation (6 limbs in AVX-512 registers)
+  - fd_r43x6_ge.h: curve points in extended homogeneous coordinates (X,Y,Z,T)
+  - FD_R43X6_QUAD: 4 field elements in 3 AVX512 registers
+  - fd_curve25519_secure.c: constant-time scalar multiplication
+  - Performance: ~34.7 us/verify on 2.3 GHz Icelake (3.9x faster than scalar)
+
+CRITICAL HISTORY:
+  Issue #38: "sigverify: match dalek verify_strict"
+  Filed: Early 2023
+  Resolved: PR #471, June 28, 2023
+
+  The original Firedancer SigVerify was derived from OpenSSL and was
+  MORE PERMISSIVE than ed25519-dalek. This means it accepted signatures
+  that Agave would reject, which would cause a consensus split.
+
+  The fix in PR #471 was to match ed25519-dalek verify_strict behavior.
+
+  HOWEVER: The question is whether the match is PERFECT. Given the
+  complexity of Ed25519 edge cases, even after PR #471, there could be
+  subtle differences in:
+    - Non-canonical point encoding handling
+    - Small-order point detection
+    - S >= L boundary check precision
+    - Cofactor handling in the verification equation
+    - Point decompression edge cases
+
+================================================================================
+4. TWO VERIFICATION PATHS IN SOLANA (CRITICAL!)
+================================================================================
+
+This is perhaps the most important architectural detail for finding bugs:
+
+Solana has TWO DIFFERENT places where Ed25519 signatures are verified:
+
+  1. TRANSACTION SIGVERIFY: Verifies the signatures attached to transactions
+     (the ones that authorize the transaction itself)
+
+  2. ED25519 PRECOMPILE: Verifies arbitrary signatures passed as instruction
+     data (used by programs for off-chain signature verification)
+
+For Firedancer to maintain consensus with Agave, BOTH paths must produce
+identical accept/reject decisions for ALL possible inputs.
+
+POTENTIAL ATTACK VECTOR:
+  If Firedancer's transaction sigverify and precompile verification use
+  different code paths or different validation criteria, an attacker could
+  craft a transaction where:
+    - The transaction signature passes sigverify on both clients
+    - But the precompile verification of an embedded signature
+      passes on one client and fails on the other
+    - This causes a consensus split
+
+  Or vice versa: a transaction with signatures that pass on one client's
+  sigverify but fail on the other's.
+
+================================================================================
+5. KNOWN ED25519 CONSENSUS PROBLEM
+================================================================================
+
+Source: https://hdevalence.ca/blog/2020-10-04-its-25519am/
+Author: Henry de Valence
+
+THE FUNDAMENTAL PROBLEM:
+  Ed25519 does not clearly define criteria for signature validity. Even
+  standards-conformant implementations are not required to agree on whether
+  a signature is valid. Different implementations may not (and in practice,
+  do not) agree on validation criteria in subtle edge cases.
+
+FIVE AXES OF DIVERGENCE (from de Valence's survey):
+
+  1. Canonical S check: Whether S >= L is rejected
+     - Most implementations check this, but some use a "hackier" check
+       (only checking top 3 bits are unset, rather than full comparison)
+
+  2. Canonical point encoding: Whether non-canonical y-coordinates are rejected
+     - RFC 8032 says reject; many implementations accept
+
+  3. Verification equation: Cofactored [8]R = [8]([s]B - [k]A) vs
+     cofactorless R = [s]B - [k]A
+     - These accept DIFFERENT sets of signatures
+
+  4. Equality check method: Compare curve points vs compare byte encodings
+     - Byte comparison accidentally checks canonical R encoding
+
+  5. Ad-hoc checks: Implementation-specific extra rules
+     - e.g., libsodium rejects small-order A and R (non-standard)
+     - e.g., ed25519-dalek verify_strict rejects small-order A and R
+
+SURVEY RESULTS:
+  - RFC 8032 is incompatible with ALL tested implementations except BouncyCastle
+  - "Classic" (ref10-derived): Go, OpenSSL, Tor - cofactorless, no canonical A check
+  - libsodium: changed behavior between 1.0.15 and 1.0.16
+  - Batch vs single verification: 3 implementations showed INCONSISTENT results
+
+IMPACT ON SOLANA:
+  Firedancer (C, custom impl) and Agave (Rust, ed25519-dalek 1.0.1) are
+  two different implementations. Even though Firedancer tried to match
+  ed25519-dalek behavior (Issue #38), the complexity of Ed25519 edge cases
+  means subtle differences can persist.
+
+================================================================================
+6. ED25519-DALEK VERIFY vs VERIFY_STRICT (CRITICAL!)
+================================================================================
+
+ed25519-dalek 1.0.1 provides multiple verification functions:
+
+verify() [standard]:
+  - Uses COFACTORLESS equation: [S]B = R + [k]A
+  - Checks S < L (canonical S)
+  - Does NOT reject small-order A or R
+  - Permits weak keys
+  - Matches ref10, Go crypto/ed25519, OpenSSL, ed25519-donna behavior
+
+verify_strict() [stricter, non-RFC8032]:
+  - Uses COFACTORLESS equation: [S]B = R + [k]A (SAME as verify!)
+  - Checks S < L (canonical S)
+  - REJECTS small-order R: signature_R.is_small_order()
+  - REJECTS small-order A: self.point.is_small_order()
+  - Matches libsodium 1.0.16-18 behavior
+
+CRITICAL BUG IN DOCUMENTATION (Issue #663):
+  The documentation of verify_strict CLAIMS it uses the cofactored equation
+  [8][S]B = [8]R + [8][k]A, but the IMPLEMENTATION actually uses the
+  cofactorless equation [S]B = R + [k]A. The documentation is WRONG.
+
+  One of the original library authors even stated "we currently multiply by
+  the cofactor in verify_strict()" - but this does not appear to be true
+  in the actual code.
+
+  This documentation bug could cause Firedancer developers to implement
+  the WRONG equation if they relied on documentation rather than source code.
+
+WHAT SOLANA CURRENTLY USES:
+  - Transaction sigverify: Uses verify_strict (ed25519-dalek 1.0.1)
+  - Ed25519 precompile: Uses verify_strict (after feature gate activation)
+
+  Therefore Solana's ACTUAL rules are:
+    1. S must be canonical (S < L)
+    2. Small-order A is REJECTED
+    3. Small-order R is REJECTED
+    4. Verification equation is COFACTORLESS: [S]B = R + [k]A
+    5. Non-canonical point encodings: handled by ed25519-dalek's decoder
+
+  This is NEITHER RFC 8032 NOR ZIP-215. It is a unique "Solana flavor" of
+  Ed25519 verification.
+
+================================================================================
+7. SPECIFIC EDGE CASES FOR TESTING
+================================================================================
+
+Based on the ed25519-speccheck test vectors and the "Taming the Many EdDSAs"
+paper, here are the critical edge cases to test:
+
+A. SCALAR (S) EDGE CASES:
+  - S = 0: Should pass (valid reduced scalar)
+  - S = L - 1: Should pass (maximum valid canonical S)
+  - S = L: Should FAIL (non-canonical, first value >= L)
+  - S = L + 1: Should FAIL
+  - S >> L (e.g., S with top bits set): Should FAIL
+  - S with only top 3 bits set but still < L: Should pass
+  - S where the "hackier" 3-bit check passes but full check fails:
+    This can happen because L = 2^252 + ..., so values near 2^252 might
+    pass a top-3-bits check but still be >= L
+
+B. PUBLIC KEY (A) EDGE CASES:
+  - A = identity point (0, 1): Small-order, should be REJECTED by verify_strict
+  - A = (0, -1): Order 2, should be REJECTED
+  - A = other small-order points (orders 4, 8): Should be REJECTED
+  - A with non-canonical y (y >= p, where p = 2^255-19):
+    Behavior depends on point decoder
+  - A not on curve: Should be rejected during decompression
+  - A on the twist (wrong curve): Should be rejected during decompression
+
+C. SIGNATURE R COMPONENT EDGE CASES:
+  - R = identity point (0, 1): Small-order, should be REJECTED by verify_strict
+  - R = (0, -1): Order 2, should be REJECTED
+  - R = other small-order points: Should be REJECTED
+  - R with non-canonical y encoding: Behavior depends on decoder
+  - R not on curve: Should fail decompression
+
+D. COMBINED EDGE CASES:
+  - Small-order A AND small-order R with S = 0
+  - Mixed-order A (has torsion component) with mixed-order R
+  - Cofactored-only valid signature (passes [8]eq but fails direct eq)
+  - Non-canonical A with valid signature
+  - Non-canonical R with valid signature
+
+E. SPECCHECK VECTORS (12 total):
+  Vec 0:  S=0, small A, small R          -> Passes both cofactored/cofactorless
+  Vec 1:  Small A only, mixed R           -> Passes both
+  Vec 2:  Small R only, mixed A           -> Passes both
+  Vec 3:  Mixed A and R                   -> Passes both
+  Vec 4:  Mixed A and R (cofactored-only) -> Passes cofactored, FAILS cofactorless
+  Vec 5:  Pre-reduction test              -> Passes cofactored, FAILS cofactorless
+  Vec 6:  S > L, out-of-bounds scalar     -> Passes both (if no S<L check!)
+  Vec 7:  S >> L, way out-of-bounds       -> Passes both (if no S<L check!)
+  Vec 8:  Non-canonical R (reduced)       -> Passes both
+  Vec 9:  Non-canonical R (unreduced)     -> Passes both
+  Vec 10: Non-canonical A (reduced)       -> Passes both
+  Vec 11: Non-canonical A (unreduced)     -> Passes both
+
+  For Solana (verify_strict):
+    Vecs 0-2 should FAIL (small-order A or R rejection)
+    Vec 3 should PASS (mixed order, not small)
+    Vec 4 should FAIL (cofactorless equation fails)
+    Vec 5 should FAIL (cofactorless equation fails)
+    Vecs 6-7 should FAIL (S >= L)
+    Vecs 8-11 depend on point decoder behavior
+
+================================================================================
+8. COFACTOR HANDLING (h=8)
+================================================================================
+
+Curve25519 has cofactor h=8. The full group has order 8*L where
+L = 2^252 + 27742317777372353535851937790883648493.
+
+TWO VERIFICATION EQUATIONS:
+  Cofactorless: [S]B = R + [k]A
+  Cofactored:   [8][S]B = [8]R + [8][k]A
+
+KEY PROPERTY:
+  Every signature accepted by cofactorless is also accepted by cofactored.
+  But cofactored accepts ADDITIONAL signatures where R or A have torsion
+  components (i.e., are not in the prime-order subgroup).
+
+IMPACT ON CONSENSUS:
+  If Firedancer uses cofactored and Agave uses cofactorless (or vice versa),
+  they will DISAGREE on certain signatures. Specifically, signatures where
+  the verification equation holds modulo 8 but not directly.
+
+  Test vector 4 from speccheck is designed to detect exactly this:
+  it passes cofactored verification but FAILS cofactorless verification.
+
+WHAT SOLANA USES:
+  ed25519-dalek 1.0.1 verify_strict uses COFACTORLESS: [S]B = R + [k]A
+  (Despite documentation suggesting otherwise - see Issue #663)
+
+  ZIP-215 uses COFACTORED: [8][S]B = [8]R + [8][k]A
+
+  If Firedancer implemented ZIP-215 (cofactored) instead of matching
+  ed25519-dalek (cofactorless), this would be a consensus-splitting bug.
+
+BATCH VERIFICATION COMPLICATION:
+  Batch verification REQUIRES the cofactored equation to give consistent
+  results. If Solana ever uses batch verification (for performance), the
+  verification equation must change to cofactored, which changes the set
+  of accepted signatures. This is exactly what SIMD-0376 proposes.
+
+================================================================================
+9. NON-CANONICAL ENCODINGS
+================================================================================
+
+Ed25519 points are encoded as 32 bytes: 255 bits of y-coordinate + 1 sign bit.
+The field prime is p = 2^255 - 19.
+
+NON-CANONICAL Y-COORDINATES:
+  Valid y-coordinates: 0 to p-1 = 2^255 - 20
+  Non-canonical y-values: p through 2^255 - 1 (i.e., 2^255-19 through 2^255-1)
+
+  This gives exactly 19 possible non-canonical y-coordinate values.
+  Among these:
+    - 2 encode small-order points
+    - 10 of the remaining 17 decode to valid curve points (all mixed order)
+    - 7 do not decode to valid curve points
+
+  Total non-canonical point encodings: approximately 25 (including sign bit
+  variants and the fact that y=0 and y=1 both allow x=0, giving identical
+  points for both sign choices).
+
+RFC 8032 SAYS: Reject non-canonical (y >= p)
+ZIP-215 SAYS: Allow non-canonical (no reduction requirement)
+ed25519-dalek: Behavior depends on the point decoder implementation
+
+CONSENSUS RISK:
+  If Firedancer and Agave disagree on whether to accept a non-canonical
+  encoding of a point, they will disagree on whether a signature using
+  that encoding is valid.
+
+  For example, if Firedancer's point decoder reduces y mod p before
+  processing but Agave's doesn't (or vice versa), they will disagree
+  on signatures where A or R uses a non-canonical encoding.
+
+SPECIFIC VALUES TO TEST:
+  y = p     = 2^255 - 19  (encodes the same point as y=0)
+  y = p + 1 = 2^255 - 18  (encodes the same point as y=1)
+  ...
+  y = 2^255 - 1            (encodes the same point as y=18)
+
+================================================================================
+10. SMALL-ORDER POINTS
+================================================================================
+
+The 8-torsion subgroup of Curve25519 (edwards form) contains 8 points:
+
+  Order 1: Identity point (0, 1)
+  Order 2: (0, -1) = (0, p-1)
+  Order 4: Two points
+  Order 8: Four points
+
+These points satisfy [8]P = identity for all P in the torsion subgroup.
+
+Ed25519-dalek's is_small_order() check:
+  Multiplies the point by 8 and checks if the result is the identity.
+  This catches all 8 torsion points.
+
+14 SMALL-ORDER ENCODINGS (including non-canonical):
+  The 8 small-order points have canonical encodings, but some also have
+  non-canonical encodings (when y < 19, the non-canonical encoding y+p
+  also encodes the same point). This gives approximately 14 total encodings
+  that decode to small-order points.
+
+VERIFY_STRICT BEHAVIOR:
+  verify_strict rejects signatures where:
+    - A (public key) is small-order: self.point.is_small_order() returns true
+    - R (signature component) is small-order: signature_R.is_small_order()
+
+  This is a Solana-specific behavior (not RFC 8032, not ZIP-215).
+
+CONSENSUS RISK:
+  If Firedancer's small-order detection differs from ed25519-dalek's:
+    - Different set of points considered "small order"
+    - Different handling of non-canonical encodings of small-order points
+    - Edge case: A point that is small-order but encoded non-canonically
+      might pass one implementation's check but fail another's
+
+================================================================================
+11. ACTIVE SIMDS (SOLANA IMPROVEMENT DOCUMENTS)
+================================================================================
+
+SIMD-0376: Ed25519 Signature Verification Changes
+  Author: David Rubin (Syndica), Charles Li
+  Status: Review (as of 2026-01-28)
+  Proposal: Replace verify_strict semantics with ZIP-215 rules
+
+  This would change Solana's Ed25519 verification from:
+    - Cofactorless equation [S]B = R + [k]A
+    - Small-order A/R rejection
+  To:
+    - Cofactored equation [8][S]B = [8]R + [8][k]A
+    - Allow non-canonical encodings
+    - No small-order rejection
+
+  THIS IS A MASSIVE CHANGE in the set of accepted signatures.
+
+SIMD-0453: Ed25519 Precompile Signature Verification with SIMD376/ZIP-215
+  Author: zz-sol
+  Status: Review (opened 2026-01-27)
+  Extends SIMD-0376 to cover the Ed25519 precompile specifically.
+
+IMPLICATIONS:
+  If SIMD-0376 is adopted, Firedancer would need to implement ZIP-215
+  rather than matching ed25519-dalek verify_strict. During the transition
+  period, there could be consensus issues if clients disagree on which
+  rules to apply.
+
+  The existence of these SIMDs confirms that the Solana community
+  recognizes the current Ed25519 verification rules as problematic
+  and is actively considering changing them.
+
+================================================================================
+12. TEST VECTOR SOURCES
+================================================================================
+
+A. ED25519-SPECCHECK (Facebook/Novi)
+   https://github.com/novifinancial/ed25519-speccheck
+   - 12 test vectors targeting specific edge cases
+   - Tests cofactored vs cofactorless, scalar bounds, non-canonical encodings
+   - Tested many popular libraries: BoringSSL, LibSodium, Go, Dalek, etc.
+   - Found significant divergence across implementations
+
+B. WYCHEPROOF (Google, now C2SP community)
+   https://github.com/C2SP/wycheproof
+   - ed25519_test.json in testvectors_v1/
+   - Comprehensive test vectors including non-canonical cases
+   - Each vector has flags explaining what edge case it tests
+   - Community-maintained, regularly updated
+
+C. "TAMING THE MANY EDDSAS" PAPER
+   https://eprint.iacr.org/2020/1244
+   Authors: Chalkias, Garillot, Nikolaenko (Facebook/Novi)
+   - Comprehensive survey of Ed25519 implementation behavior
+   - Tested 40+ libraries
+   - Documented which checks each library performs
+   - Provides concrete test vectors for each divergence axis
+
+D. HENRY DE VALENCE'S BLOG + ZIP-215
+   https://hdevalence.ca/blog/2020-10-04-its-25519am/
+   https://zips.z.cash/zip-0215
+   - Describes the 5 axes of divergence
+   - Provides guidance on creating consensus-compatible implementations
+   - References ~25 non-canonical point encodings
+
+E. FIREDANCER CONFORMANCE SUITE
+   https://github.com/firedancer-io/solana-conformance
+   - Differential testing between Firedancer and Agave
+   - Protobuf-based test fixtures
+   - Includes fuzzing harnesses
+   - May or may not have comprehensive Ed25519 edge case coverage
+
+F. ED25519-CONSENSUS LIBRARY
+   https://github.com/penumbra-zone/ed25519-consensus
+   - Implements ZIP-215 rules in Rust
+   - Fork of ed25519-zebra with Zcash-specific parts removed
+   - Contains its own test vectors
+
+================================================================================
+13. PREVIOUS CONSENSUS BUGS IN OTHER CHAINS
+================================================================================
+
+ZCASH:
+  - libsodium changed Ed25519 validation between releases 1.0.15 and 1.0.16
+  - zcashd was forced to pin an older libsodium version
+  - Zebra's first attempt to match zcashd was incompatible (wrong libsodium
+    compile-time config)
+  - Led to creation of ZIP-215
+
+NEAR PROTOCOL (Issue #2700):
+  - Filed May 21, 2020
+  - Different Ed25519 implementations accept different signatures
+  - Attack vectors: node divergence, light client DoS, malicious validator
+  - "libsodium rejects signatures where either the key or the R value is a
+    small-order point. This behavior is not prescribed by any standard."
+  - Follow-up Issue #3216: Need for unambiguous Ed25519 specification
+
+TOR:
+  - ed25519-donna's batch verification created a denial-of-service bug
+  - Issue #40078 on Tor GitLab: "Potential consensus divergence from Ed25519
+    edge cases"
+
+MONERO:
+  - Small-order point malleability led to a double-spend (technically
+    octuple-spend due to h=8) vulnerability in CryptoNote
+  - Attacker could add a low-order point to an existing transaction
+
+BITCOIN (historical):
+  - Similar issue with ECDSA-secp256k1 signature malleability
+  - Led to development of libsecp256k1 with guaranteed consistent behavior
+
+SOLANA-SPECIFIC:
+  - No publicly documented Ed25519 consensus split between Firedancer and Agave
+  - However, Issue #38 confirms the original Firedancer implementation WAS
+    incompatible (more permissive than Agave)
+  - The Firedancer team stated they are "generally opposed to adding new
+    cryptography to the protocol" due to consensus risk
+  - Differential fuzzing by Asymmetric Research has found consensus bugs
+    between Agave and Firedancer in OTHER areas
+
+================================================================================
+14. ATTACK SCENARIOS
+================================================================================
+
+SCENARIO 1: Non-Canonical Point Encoding Disagreement
+  Attacker crafts a signature where R uses a non-canonical y-coordinate
+  (e.g., y = p + 5). If Firedancer's point decoder handles this differently
+  from ed25519-dalek's (e.g., one reduces mod p, the other rejects), the
+  signature is valid on one client and invalid on the other.
+
+SCENARIO 2: Small-Order Point Detection Mismatch
+  Attacker creates a public key that is small-order but encoded in a way
+  that bypasses one implementation's is_small_order() check but not the
+  other. For example, a non-canonical encoding of a small-order point
+  might be checked differently.
+
+SCENARIO 3: S Boundary Check Precision
+  Attacker creates a signature where S is exactly L or L+1. If one
+  implementation uses a "hackier" 3-bit MSB check and the other does a
+  full comparison against L, they could disagree.
+
+SCENARIO 4: Cofactor Equation Mismatch
+  If Firedancer accidentally uses the cofactored equation (as ZIP-215
+  specifies) while Agave uses cofactorless (as ed25519-dalek actually
+  implements), test vector 4 from speccheck would pass on Firedancer
+  and fail on Agave.
+
+SCENARIO 5: Precompile vs SigVerify Mismatch
+  Even if both clients match for one verification path, they might
+  disagree on the other. A transaction could be crafted where the
+  transaction signature passes but the embedded precompile verification
+  fails on one client.
+
+SCENARIO 6: Batch vs Single Verification Inconsistency
+  If either client uses batch verification for performance, it must use
+  the cofactored equation. If single verification uses cofactorless,
+  there could be signatures that pass batch but fail single (or vice
+  versa, depending on random scalar selection).
+
+SCENARIO 7: Point Decompression Edge Cases
+  Points on the twist of Curve25519 (not on the curve itself) should fail
+  decompression. If one implementation's square root algorithm handles
+  edge cases differently (e.g., y^2 - 1 not being a quadratic residue),
+  they could disagree.
+
+================================================================================
+15. SPECIFIC HYPOTHESES FOR CONSENSUS-SPLITTING BUGS
+================================================================================
+
+Based on this research, the highest-probability areas for consensus bugs are:
+
+HYPOTHESIS 1 (HIGH PRIORITY): Non-canonical encoding handling mismatch
+  Firedancer's C implementation and ed25519-dalek 1.0.1 may handle
+  non-canonical y-coordinates (y >= 2^255-19) differently during point
+  decompression. The C code likely uses a different field arithmetic
+  library than curve25519-dalek, and reduction behavior may differ.
+
+  TEST: Create signatures using all 19 non-canonical y-values for both
+  A and R. Verify on both clients.
+
+HYPOTHESIS 2 (HIGH PRIORITY): Cofactor equation mismatch
+  Given that:
+    - ed25519-dalek's documentation CLAIMS verify_strict uses cofactored
+    - The IMPLEMENTATION actually uses cofactorless
+    - Firedancer developers might have relied on documentation
+    - ZIP-215 (which Firedancer might have referenced) uses cofactored
+
+  Firedancer might use the cofactored equation while Agave uses cofactorless.
+
+  TEST: Use speccheck vector 4 (cofactored-only valid signature).
+  If it passes on Firedancer but fails on Agave, this confirms the bug.
+
+HYPOTHESIS 3 (MEDIUM PRIORITY): Small-order detection algorithm difference
+  ed25519-dalek checks is_small_order() by computing [8]P and checking
+  if the result is the identity. Firedancer's C implementation might use
+  a different algorithm (e.g., checking against a hardcoded table of 14
+  known small-order encodings). These could disagree on edge cases,
+  particularly non-canonical encodings of small-order points.
+
+  TEST: All 14 known small-order point encodings (including non-canonical)
+  as both A and R values.
+
+HYPOTHESIS 4 (MEDIUM PRIORITY): S >= L boundary precision
+  The order L = 2^252 + 27742317777372353535851937790883648493 is a
+  252-bit number. A "hackier" check (top 3 bits of the 32-byte encoding
+  must be 0) is not equivalent to S < L. Values between L and 2^253 - 1
+  would pass the 3-bit check but should fail the full check.
+
+  TEST: Signatures with S = L, S = L+1, S = 2^252, and values in the
+  range [L, 2^253).
+
+HYPOTHESIS 5 (LOWER PRIORITY): Point decompression square root edge cases
+  Computing x from y requires taking a square root in the field. The
+  algorithm involves computing (u/v)^((p+3)/8) and then checking the
+  result. Edge cases around u=0, v=0, or non-residue cases might be
+  handled differently.
+
+  TEST: Points where x=0 (y=1 and y=-1), and points where the
+  decompression involves the "imaginary" square root case.
+
+HYPOTHESIS 6 (TRANSITION RISK): SIMD-0376 adoption timing
+  If SIMD-0376 is activated and one client transitions to ZIP-215 rules
+  before the other, there would be a consensus split during the transition.
+  The verification equation changes, the small-order rejection changes,
+  and the non-canonical handling changes all at once.
+
+RECOMMENDED TESTING APPROACH:
+  1. Run all 12 speccheck vectors through both Firedancer and Agave
+  2. Run Wycheproof ed25519_test.json through both
+  3. Generate all ~25 non-canonical point encodings and test as A and R
+  4. Test all 14 small-order point encodings as A and R
+  5. Test S boundary values: S=0, S=1, S=L-1, S=L, S=L+1, S=2*L, etc.
+  6. Generate cofactored-only valid signatures and test both paths
+  7. Use the firedancer-io/solana-conformance framework for differential testing
+  8. Fuzz random malformed signatures focusing on the edge case regions
+
+================================================================================
+SOURCES
+================================================================================
+
+ZIP-215 Specification:
+  https://zips.z.cash/zip-0215
+
+Henry de Valence - "It's 255:19AM":
+  https://hdevalence.ca/blog/2020-10-04-its-25519am/
+
+ed25519-dalek Documentation (v1.0.1):
+  https://docs.rs/crate/ed25519-dalek/1.0.1
+
+ed25519-dalek verify_strict Documentation Bug (Issue #663):
+  https://github.com/dalek-cryptography/curve25519-dalek/issues/663
+
+Firedancer Issue #38 (SigVerify Compatibility):
+  https://github.com/firedancer-io/firedancer/issues/38
+
+Firedancer AVX512 Implementation (PR #716):
+  https://github.com/firedancer-io/firedancer/pull/716
+
+ed25519-speccheck (Novi/Facebook):
+  https://github.com/novifinancial/ed25519-speccheck
+
+"Taming the Many EdDSAs" Paper:
+  https://eprint.iacr.org/2020/1244
+
+Wycheproof Test Vectors:
+  https://github.com/C2SP/wycheproof
+
+ed25519-consensus Library:
+  https://github.com/penumbra-zone/ed25519-consensus
+
+NEAR Protocol Ed25519 Issue (#2700):
+  https://github.com/near/nearcore/issues/2700
+
+Solana Ed25519 Instruction Source:
+  https://github.com/solana-labs/solana/blob/master/sdk/src/ed25519_instruction.rs
+
+Agave SigVerify Source:
+  https://github.com/anza-xyz/agave/blob/main/perf/src/sigverify.rs
+
+Firedancer Ed25519 Source:
+  https://github.com/firedancer-io/firedancer/tree/main/src/ballet/ed25519
+
+Firedancer Conformance Suite:
+  https://github.com/firedancer-io/solana-conformance
+
+SIMD-0376 / SIMD-0453 (ZIP-215 Adoption Proposals):
+  https://github.com/solana-foundation/solana-improvement-documents/pulls
+
+solana-ed25519-dalek Fork:
+  https://docs.rs/crate/solana-ed25519-dalek/0.2.0
+
+Asymmetric Research - Differential Fuzzing:
+  https://blog.asymmetric.re/finding-fractures-an-intro-to-differential-fuzzing-in-rust/
+
+Firedancer Bug Bounty ($1M):
+  https://cryptorank.io/news/feed/1020e-solana-1-million-bug-bounty-firedancer-debut
+
+RFC 8032 - EdDSA:
+  https://datatracker.ietf.org/doc/html/rfc8032

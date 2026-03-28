@@ -1,0 +1,378 @@
+================================================================================
+HYPOTHESIS H1: Cofactor Equation Mismatch Test
+Date: 2026-03-28T08:42:11.707218
+================================================================================
+
+BACKGROUND:
+  Firedancer: cofactorless [S]B = R + [k]A
+  Dalek verify_strict: cofactorless [S]B = R + [k]A
+    (Dalek docs FALSELY claim cofactored - see issue #663)
+  Both reject small-order R and A.
+
+  A cofactor divergence needs a point with torsion component that
+  passes small-order checks but causes different equation results.
+
+================================================================================
+PART 1: ed25519-speccheck Test Vectors
+================================================================================
+
+--- Case 0: Small A, small R, S=0 ---
+  Public key A: small_order=True, order_info=divides 8 (small order)
+    [L]A==O: False, [8]A==O: True
+  Signature R: small_order=True, order_info=divides 8 (small order)
+    [L]R==O: False, [8]R==O: True
+  Scalar S: 0
+  S < L: True
+  Firedancer (cofactorless): REJECT - ERR_PUBKEY: small order
+  Cofactored [8](SB) = [8](R+kA): REJECT - ERR: A small order
+  Cofactored_v2 [8S]B = [8]R+[8k]A: REJECT - ERR: A small order
+
+--- Case 1: Small A, mixed R, 0 < S < L ---
+  Public key A: small_order=True, order_info=divides 8 (small order)
+    [L]A==O: False, [8]A==O: True
+  Signature R: small_order=False, order_info=8*L or divisor (mixed/full order)
+    [L]R==O: False, [8]R==O: False
+  Scalar S: 2113703512797214624534965880840934660546704270353641149208112258729152396197
+  S < L: True
+  Firedancer (cofactorless): REJECT - ERR_PUBKEY: small order
+  Cofactored [8](SB) = [8](R+kA): REJECT - ERR: A small order
+  Cofactored_v2 [8S]B = [8]R+[8k]A: REJECT - ERR: A small order
+
+--- Case 2: Mixed A, small R, 0 < S < L ---
+  Public key A: small_order=False, order_info=8*L or divisor (mixed/full order)
+    [L]A==O: False, [8]A==O: False
+  Signature R: small_order=True, order_info=divides 8 (small order)
+    [L]R==O: False, [8]R==O: True
+  Scalar S: 6400915605679909996242840422818000508432075134679789789133997810406552521612
+  S < L: True
+  Firedancer (cofactorless): REJECT - ERR_SIG: R small order
+  Cofactored [8](SB) = [8](R+kA): REJECT - ERR: R small order
+  Cofactored_v2 [8S]B = [8]R+[8k]A: REJECT - ERR: R small order
+
+--- Case 3: Mixed A, mixed R, 0 < S < L (both have torsion) ---
+  Public key A: small_order=False, order_info=8*L or divisor (mixed/full order)
+    [L]A==O: False, [8]A==O: False
+  Signature R: small_order=False, order_info=8*L or divisor (mixed/full order)
+    [L]R==O: False, [8]R==O: False
+  Scalar S: 4439283733321267161256394206552403839369702938793915363728479299657602601095
+  S < L: True
+  Firedancer (cofactorless): ACCEPT - SUCCESS
+  Cofactored [8](SB) = [8](R+kA): ACCEPT - SUCCESS (cofactored)
+  Cofactored_v2 [8S]B = [8]R+[8k]A: ACCEPT - SUCCESS (cofactored_v2)
+
+--- Case 4: CRITICAL: passes cofactored, fails cofactorless (mixed A and R) ---
+  Public key A: small_order=False, order_info=8*L or divisor (mixed/full order)
+    [L]A==O: False, [8]A==O: False
+  Signature R: small_order=False, order_info=8*L or divisor (mixed/full order)
+    [L]R==O: False, [8]R==O: False
+  Scalar S: 4117342047622447404763526080302509593345945042199131217579511489248997721694
+  S < L: True
+  Firedancer (cofactorless): REJECT - ERR_MSG: equation check failed
+  Cofactored [8](SB) = [8](R+kA): ACCEPT - SUCCESS (cofactored)
+  Cofactored_v2 [8S]B = [8]R+[8k]A: ACCEPT - SUCCESS (cofactored_v2)
+  *** DIVERGENCE: cofactorless vs cofactored ***
+  *** DIVERGENCE: cofactorless vs cofactored_v2 ***
+
+--- Case 5: Distinguishes [8](R+kA)=[8]sB from [8]R+[8k]A=[8s]B ---
+  Public key A: small_order=False, order_info=8*L or divisor (mixed/full order)
+    [L]A==O: False, [8]A==O: False
+  Signature R: small_order=False, order_info=L (prime subgroup)
+    [L]R==O: True, [8]R==O: False
+  Scalar S: 2467239920871053481014789316732223553200700089471957670691070624822075067364
+  S < L: True
+  Firedancer (cofactorless): REJECT - ERR_MSG: equation check failed
+  Cofactored [8](SB) = [8](R+kA): ACCEPT - SUCCESS (cofactored)
+  Cofactored_v2 [8S]B = [8]R+[8k]A: ACCEPT - SUCCESS (cofactored_v2)
+  *** DIVERGENCE: cofactorless vs cofactored ***
+  *** DIVERGENCE: cofactorless vs cofactored_v2 ***
+
+--- Case 6: S > L (out of bounds scalar) ---
+  Public key A: small_order=False, order_info=L (prime subgroup)
+    [L]A==O: True, [8]A==O: False
+  Signature R: small_order=False, order_info=L (prime subgroup)
+    [L]R==O: True, [8]R==O: False
+  Scalar S: 9338915906590363516491694484583523736220062350169547125549314637730105687892
+  S < L: False
+  Firedancer (cofactorless): REJECT - ERR_SIG: S >= L
+  Cofactored [8](SB) = [8](R+kA): REJECT - ERR: S >= L
+  Cofactored_v2 [8S]B = [8]R+[8k]A: REJECT - ERR: S >= L
+
+--- Case 7: S >> L (extremely out of bounds scalar) ---
+  Public key A: small_order=False, order_info=L (prime subgroup)
+    [L]A==O: True, [8]A==O: False
+  Signature R: small_order=False, order_info=L (prime subgroup)
+    [L]R==O: True, [8]R==O: False
+  Scalar S: 15627064587225633230707775905244052658296700198426390124606405589801866195326
+  S < L: False
+  Firedancer (cofactorless): REJECT - ERR_SIG: S >= L
+  Cofactored [8](SB) = [8](R+kA): REJECT - ERR: S >= L
+  Cofactored_v2 [8S]B = [8]R+[8k]A: REJECT - ERR: S >= L
+
+--- Case 8: Non-canonical R (reduces differently for hashing) ---
+  Public key A: small_order=False, order_info=8*L or divisor (mixed/full order)
+    [L]A==O: False, [8]A==O: False
+  Signature R: small_order=True, order_info=divides 8 (small order)
+    [L]R==O: False, [8]R==O: True
+  Scalar S: 6954114328504414119359660559358979219435276701097829974817770692774393724419
+  S < L: True
+  Firedancer (cofactorless): REJECT - ERR_SIG: R small order
+  Cofactored [8](SB) = [8](R+kA): REJECT - ERR: R small order
+  Cofactored_v2 [8S]B = [8]R+[8k]A: REJECT - ERR: R small order
+
+--- Case 9: Non-canonical R (alternative) ---
+  Public key A: small_order=False, order_info=8*L or divisor (mixed/full order)
+    [L]A==O: False, [8]A==O: False
+  Signature R: small_order=True, order_info=divides 8 (small order)
+    [L]R==O: False, [8]R==O: True
+  Scalar S: 3747907639001736297354373348590318569297581882125060248397820988022119435466
+  S < L: True
+  Firedancer (cofactorless): REJECT - ERR_SIG: R small order
+  Cofactored [8](SB) = [8](R+kA): REJECT - ERR: R small order
+  Cofactored_v2 [8S]B = [8]R+[8k]A: REJECT - ERR: R small order
+
+--- Case 10: Non-canonical A, same sig as case 11 ---
+  Public key A: small_order=True, order_info=divides 8 (small order)
+    [L]A==O: False, [8]A==O: True
+  Signature R: small_order=False, order_info=8*L or divisor (mixed/full order)
+    [L]R==O: False, [8]R==O: False
+  Scalar S: 2113703512797214624534965880840934660546704270353641149208112258729152396197
+  S < L: True
+  Firedancer (cofactorless): REJECT - ERR_PUBKEY: small order
+  Cofactored [8](SB) = [8](R+kA): REJECT - ERR: A small order
+  Cofactored_v2 [8S]B = [8]R+[8k]A: REJECT - ERR: A small order
+
+--- Case 11: Non-canonical A, same sig as case 10 (different msg) ---
+  Public key A: small_order=True, order_info=divides 8 (small order)
+    [L]A==O: False, [8]A==O: True
+  Signature R: small_order=False, order_info=8*L or divisor (mixed/full order)
+    [L]R==O: False, [8]R==O: False
+  Scalar S: 2113703512797214624534965880840934660546704270353641149208112258729152396197
+  S < L: True
+  Firedancer (cofactorless): REJECT - ERR_PUBKEY: small order
+  Cofactored [8](SB) = [8](R+kA): REJECT - ERR: A small order
+  Cofactored_v2 [8S]B = [8]R+[8k]A: REJECT - ERR: A small order
+
+================================================================================
+PART 2: Deep Dive on Case 4 (Cofactor Discriminator)
+================================================================================
+
+Case 4 is designed to PASS cofactored but FAIL cofactorless.
+This is the primary indicator for a cofactored verification equation.
+
+A4 public key (hex): cdb267ce40c5cd45306fa5d2f29731459387dbf9eb933b7bd5aed9a765b88d4d
+  is_small_order: False
+  order: 8*L or divisor (mixed/full order)
+  [L]A4==O: False
+  [8]A4==O: False
+  [L]A4 (torsion component): x=14399317868200118260347934320527232580618823971194345261214217575416788799818, y=2707385501144840649318225287225658788936804267575313519463743609750303402022
+  [L]A4 == identity: False
+  ==> A4 has a non-trivial torsion component!
+  [2]*[L]A4 == O: False
+  [4]*[L]A4 == O: False
+  [8]*[L]A4 == O: True
+
+R4 signature point (hex): 160a1cb0dc9c0258cd0a7d23e94d8fa878bcb1925f2c64246b2dee1796bed512
+  is_small_order: False
+  order: 8*L or divisor (mixed/full order)
+  [L]R4 == identity: False
+  ==> R4 has a non-trivial torsion component!
+
+Case 4 results:
+  Firedancer (cofactorless): REJECT - ERR_MSG: equation check failed
+  Cofactored:               ACCEPT - SUCCESS (cofactored)
+  Cofactored_v2:            ACCEPT - SUCCESS (cofactored_v2)
+
+CONFIRMED: Case 4 passes cofactored but fails cofactorless.
+This means IF Dalek used cofactored (as docs claim), there would be a split.
+But Dalek verify_strict actually uses cofactorless (issue #663),
+so both Firedancer and Dalek would REJECT this case.
+
+================================================================================
+PART 3: Custom Mixed-Order Point Tests
+================================================================================
+
+Constructing points of order 8*L by adding small-order torsion to B...
+
+  T = order2:
+    P = B + T encoded: 9599999999999999999999999999999999999999999999999999999999999999
+    is_small_order(P): False
+    order: 8*L or divisor (mixed/full order)
+    [L]P==O: False, [8]P==O: False
+    ==> P passes small-order check (NOT rejected)!
+    ==> But P has torsion: [L]P != O means cofactor matters!
+    This point WOULD cause cofactored != cofactorless divergence
+    if used as A in a valid signature (requires knowledge of discrete log).
+
+  T = order4_pos:
+    P = B + T encoded: 5252cc0a7f208133b620acbd4537eba2a4123bf0a8c2e4f980c3b31bb69765ea
+    is_small_order(P): False
+    order: 8*L or divisor (mixed/full order)
+    [L]P==O: False, [8]P==O: False
+    ==> P passes small-order check (NOT rejected)!
+    ==> But P has torsion: [L]P != O means cofactor matters!
+    This point WOULD cause cofactored != cofactorless divergence
+    if used as A in a valid signature (requires knowledge of discrete log).
+
+  T = order4_neg:
+    P = B + T encoded: 9bad33f580df7ecc49df5342bac8145d5bedc40f573d1b067f3c4ce449689a15
+    is_small_order(P): False
+    order: 8*L or divisor (mixed/full order)
+    [L]P==O: False, [8]P==O: False
+    ==> P passes small-order check (NOT rejected)!
+    ==> But P has torsion: [L]P != O means cofactor matters!
+    This point WOULD cause cofactored != cofactorless divergence
+    if used as A in a valid signature (requires knowledge of discrete log).
+
+  T = order8_a:
+    P = B + T encoded: da99e28ba529cdde35a25fba9059e78ecaee239f99755b9b1aa4f65df00803e2
+    is_small_order(P): False
+    order: 8*L or divisor (mixed/full order)
+    [L]P==O: False, [8]P==O: False
+    ==> P passes small-order check (NOT rejected)!
+    ==> But P has torsion: [L]P != O means cofactor matters!
+    This point WOULD cause cofactored != cofactorless divergence
+    if used as A in a valid signature (requires knowledge of discrete log).
+
+  T = order8_a_neg:
+    P = B + T encoded: 55ae61520ca466adcc4ae4a32dc1633a5d749c64a5b50f136fc3469f27e487e6
+    is_small_order(P): False
+    order: 8*L or divisor (mixed/full order)
+    [L]P==O: False, [8]P==O: False
+    ==> P passes small-order check (NOT rejected)!
+    ==> But P has torsion: [L]P != O means cofactor matters!
+    This point WOULD cause cofactored != cofactorless divergence
+    if used as A in a valid signature (requires knowledge of discrete log).
+
+  T = order8_b:
+    P = B + T encoded: 98519eadf35b995233b51b5cd23e9cc5a28b639b5a4af0ec903cb960d81b7819
+    is_small_order(P): False
+    order: 8*L or divisor (mixed/full order)
+    [L]P==O: False, [8]P==O: False
+    ==> P passes small-order check (NOT rejected)!
+    ==> But P has torsion: [L]P != O means cofactor matters!
+    This point WOULD cause cofactored != cofactorless divergence
+    if used as A in a valid signature (requires knowledge of discrete log).
+
+  T = order8_b_neg:
+    P = B + T encoded: 13661d745ad63221ca5da0456fa618713511dc60668aa464e55b09a20ff7fc1d
+    is_small_order(P): False
+    order: 8*L or divisor (mixed/full order)
+    [L]P==O: False, [8]P==O: False
+    ==> P passes small-order check (NOT rejected)!
+    ==> But P has torsion: [L]P != O means cofactor matters!
+    This point WOULD cause cofactored != cofactorless divergence
+    if used as A in a valid signature (requires knowledge of discrete log).
+
+================================================================================
+PART 4: Analyze speccheck Public Key cdb267...
+================================================================================
+
+Public key: cdb267ce40c5cd45306fa5d2f29731459387dbf9eb933b7bd5aed9a765b88d4d
+  is_small_order: False
+  [L]A == O (prime subgroup?): False
+  ==> A has a TORSION COMPONENT
+  [L]A = (14399317868200118260347934320527232580618823971194345261214217575416788799818, 2707385501144840649318225287225658788936804267575313519463743609750303402022)
+  Torsion component matches: order8_a
+  is_small_order([L]A): True
+
+  KEY FINDING: A is NOT small-order (passes check),
+  but A has torsion. Under cofactored equation, [8]A maps
+  to the prime-order subgroup, zeroing the torsion.
+  Under cofactorless, the torsion affects the result.
+
+================================================================================
+PART 5: Non-canonical Point ecffffff... (cases 10-11)
+================================================================================
+
+Non-canonical public key: ecffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff
+  Raw y value: 57896044618658097711785492504343953926634992332820282019728792003956564819948
+  y >= p: False
+  is_small_order: True
+  order: divides 8 (small order)
+  [L]A==O: False, [8]A==O: True
+
+================================================================================
+PART 6: Consensus Split Analysis
+================================================================================
+
+CRITICAL QUESTION: Can Firedancer and Dalek verify_strict disagree?
+
+Both implementations:
+  1. Use cofactorless equation: [S]B = R + [k]A
+  2. Reject S >= L
+  3. Reject small-order A and R
+
+The cofactor equation hypothesis (H1) CANNOT cause a consensus split IF:
+  - Both truly use cofactorless (which they do)
+  - Both have the same small-order rejection criteria
+
+HOWEVER, there are still potential divergence points:
+  a) Do both define 'small order' identically?
+     Firedancer checks: X==0 OR Y==0 OR Y==order8_y0 OR Y==order8_y1
+     Dalek checks: calls is_small_order() which multiplies by cofactor
+
+Testing if Firedancer's Y/X check is equivalent to [8]P == O:
+
+  order1_identity: fd_check=True, [8]P==O=True => MATCH
+  order2: fd_check=True, [8]P==O=True => MATCH
+  order4_pos: fd_check=True, [8]P==O=True => MATCH
+  order4_neg: fd_check=True, [8]P==O=True => MATCH
+  order8_a: fd_check=True, [8]P==O=True => MATCH
+  order8_a_neg: fd_check=True, [8]P==O=True => MATCH
+  order8_b: fd_check=True, [8]P==O=True => MATCH
+  order8_b_neg: fd_check=True, [8]P==O=True => MATCH
+
+Testing mixed-order points (order 8*L):
+  B+order2: fd_check=False, [8]P==O=False => MATCH
+  B+order4_pos: fd_check=False, [8]P==O=False => MATCH
+  B+order4_neg: fd_check=False, [8]P==O=False => MATCH
+  B+order8_a: fd_check=False, [8]P==O=False => MATCH
+  B+order8_a_neg: fd_check=False, [8]P==O=False => MATCH
+  B+order8_b: fd_check=False, [8]P==O=False => MATCH
+  B+order8_b_neg: fd_check=False, [8]P==O=False => MATCH
+
+================================================================================
+PART 7: Summary Results Table
+================================================================================
+
+Case |  FD cofactorless |   Cofactored |  Cofactored_v2 |  Diverge?
+----------------------------------------------------------------------
+   0 |           REJECT |       REJECT |         REJECT |        no
+   1 |           REJECT |       REJECT |         REJECT |        no
+   2 |           REJECT |       REJECT |         REJECT |        no
+   3 |           ACCEPT |       ACCEPT |         ACCEPT |        no
+   4 |           REJECT |       ACCEPT |         ACCEPT |       YES
+   5 |           REJECT |       ACCEPT |         ACCEPT |       YES
+   6 |           REJECT |       REJECT |         REJECT |        no
+   7 |           REJECT |       REJECT |         REJECT |        no
+   8 |           REJECT |       REJECT |         REJECT |        no
+   9 |           REJECT |       REJECT |         REJECT |        no
+  10 |           REJECT |       REJECT |         REJECT |        no
+  11 |           REJECT |       REJECT |         REJECT |        no
+
+================================================================================
+CONCLUSION
+================================================================================
+
+Cofactored vs cofactorless divergences found in cases: [4, 5]
+
+However, the KEY question is: does Dalek verify_strict use cofactored?
+
+ANSWER: NO. Despite the documentation claiming cofactored,
+Dalek verify_strict uses COFACTORLESS [S]B = R + [k]A (issue #663).
+This is the SAME equation Firedancer uses.
+
+THEREFORE: Hypothesis H1 (cofactor equation mismatch) is
+UNLIKELY to cause a consensus split between Firedancer and Agave/Dalek,
+because both use the same cofactorless equation.
+
+REMAINING RISK: If the small-order rejection criteria differ subtly,
+a mixed-order point could still slip through one but not the other.
+This is a separate hypothesis (small-order check divergence) worth testing
+with the actual Dalek/Agave implementations.
+
+NEXT STEPS:
+  1. Run speccheck cases against actual Dalek verify_strict (Rust harness)
+  2. Focus on small-order CHECK differences (separate from equation)
+  3. Test non-canonical encoding edge cases (cases 8-11)
+  4. Investigate if batch verification uses different equations

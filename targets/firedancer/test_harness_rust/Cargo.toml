@@ -1,0 +1,15 @@
+[package]
+name = "ed25519_test"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+# Exact same version Agave/Solana pins in their workspace Cargo.toml:
+#   ed25519-dalek = "=1.0.1"
+# Agave's Signature::verify() calls ed25519_dalek::PublicKey::verify_strict()
+# for transaction sigverify. The ed25519 precompile also uses verify_strict
+# after feature gate ed9tNscbWLYBooxWA7FE2B5KHWs8A6sxfY8EzezEcoo was activated.
+ed25519-dalek = "=1.0.1"
+hex = "0.4"
+serde = { version = "=1.0.171", features = ["derive"] }
+serde_json = "=1.0.99"

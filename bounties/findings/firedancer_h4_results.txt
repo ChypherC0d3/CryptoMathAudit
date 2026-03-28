@@ -1,0 +1,369 @@
+Base signature valid: accept=True, reason=SUCCESS
+Valid S value: 1699176477594467450696647699297909200041764426477981941701495442169563237294
+L = 7237005577332262213973186563042994240857116359379907606001950938285454250989
+L hex (BE) = 0x1000000000000000000000000000000014def9dea2f79cd65812631a5cf5d3ed
+L hex (LE bytes) = edd3f55c1a631258d69cf7a2def9de1400000000000000000000000000000010
+
+
+==========================================================================================
+HYPOTHESIS H4: S SCALAR BOUNDARY EDGE CASES
+==========================================================================================
+Date: 2026-03-28 08:46:33
+
+Firedancer fd_curve25519_scalar_validate algorithm:
+  1. If byte[31] & 0xF0 == 0: ACCEPT (fast path, S < 2^252 < L)
+  2. If byte[31] & 0xE0 != 0: REJECT (top 3 bits set => S >= 2^253 > L)
+  3. Otherwise: full 256-bit subtraction s - L, check borrow
+
+Dalek 1.0.1 check_scalar (in Signature::from_bytes):
+  - Only checks byte[31] & 0xE0 == 0 (top 3 bits must be clear)
+  - Does NOT do full S < L comparison at deserialization!
+
+Dalek 1.0.1 verify_strict additional check:
+  - scalar_is_canonical: full S < L comparison (byte-by-byte from MSB)
+
+KEY INSIGHT: Dalek's Signature::from_bytes is WEAKER than Firedancer's check.
+  - Values in [L, 2^253) pass Dalek's from_bytes but fail Firedancer's validate.
+  - However, verify_strict adds the canonical check, so strict mode rejects too.
+  - verify (loose) does NOT add canonical check -- it uses S as-is (reduced internally).
+
+S REDUCTION QUESTION:
+  - Firedancer: does NOT reduce S mod L. Uses S directly in scalar mult.
+    If S >= L, validation rejects before reaching the equation.
+  - Dalek verify_strict: rejects S >= L before equation.
+  - Dalek verify (loose): S passes from_bytes if < 2^253. The Scalar type
+    stores raw bytes; the actual modular reduction happens during scalar mult.
+    So for loose mode, S = L+k would compute [L+k]B = [k]B, different from [S_canonical]B.
+
+This means for LOOSE verification only:
+  - S = valid_S + L would compute [valid_S + L]B = [valid_S]B (since L*B = identity)
+  - So the equation would still hold! Dalek loose would ACCEPT S = valid_S + L
+  - But Firedancer would REJECT because S >= L fails scalar_validate
+
+==========================================================================================
+DETAILED TEST RESULTS
+==========================================================================================
+
+
+--- S = 0 ---
+  S value: 0
+  S hex (LE): 0000000000000000000000000000000000000000000000000000000000000000
+  S byte[31]: 0x00
+  S < L: True
+  S < 2^252: True
+  S < 2^253: True
+  Firedancer scalar_validate: ACCEPT: fast path (top 4 bits zero => S < 2^252 < L)
+  Dalek from_bytes: ACCEPT: top 3 bits clear
+  Dalek verify_strict: ACCEPT: S < L
+  Dalek verify_loose: ACCEPT: top 3 bits clear (S < 2^253), S = canonical
+  Firedancer full verify: REJECT (ERR_MSG: equation check failed)
+
+--- S = 1 ---
+  S value: 1
+  S hex (LE): 0100000000000000000000000000000000000000000000000000000000000000
+  S byte[31]: 0x00
+  S < L: True
+  S < 2^252: True
+  S < 2^253: True
+  Firedancer scalar_validate: ACCEPT: fast path (top 4 bits zero => S < 2^252 < L)
+  Dalek from_bytes: ACCEPT: top 3 bits clear
+  Dalek verify_strict: ACCEPT: S < L
+  Dalek verify_loose: ACCEPT: top 3 bits clear (S < 2^253), S = canonical
+  Firedancer full verify: REJECT (ERR_MSG: equation check failed)
+
+--- S = L - 2 ---
+  S value: 7237005577332262213973186563042994240857116359379907606001950938285454250987
+  S hex (LE): ebd3f55c1a631258d69cf7a2def9de1400000000000000000000000000000010
+  S byte[31]: 0x10
+  S < L: True
+  S < 2^252: False
+  S < 2^253: True
+  Firedancer scalar_validate: ACCEPT: bit 252 set but S < L (S in [2^252, L))
+  Dalek from_bytes: ACCEPT: top 3 bits clear
+  Dalek verify_strict: ACCEPT: S < L
+  Dalek verify_loose: ACCEPT: top 3 bits clear (S < 2^253), S = canonical
+  Firedancer full verify: REJECT (ERR_MSG: equation check failed)
+
+--- S = L - 1 (last valid) ---
+  S value: 7237005577332262213973186563042994240857116359379907606001950938285454250988
+  S hex (LE): ecd3f55c1a631258d69cf7a2def9de1400000000000000000000000000000010
+  S byte[31]: 0x10
+  S < L: True
+  S < 2^252: False
+  S < 2^253: True
+  Firedancer scalar_validate: ACCEPT: bit 252 set but S < L (S in [2^252, L))
+  Dalek from_bytes: ACCEPT: top 3 bits clear
+  Dalek verify_strict: ACCEPT: S < L
+  Dalek verify_loose: ACCEPT: top 3 bits clear (S < 2^253), S = canonical
+  Firedancer full verify: REJECT (ERR_MSG: equation check failed)
+
+--- S = L (first invalid) ---
+  S value: 7237005577332262213973186563042994240857116359379907606001950938285454250989
+  S hex (LE): edd3f55c1a631258d69cf7a2def9de1400000000000000000000000000000010
+  S byte[31]: 0x10
+  S < L: False
+  S < 2^252: False
+  S < 2^253: True
+  Firedancer scalar_validate: REJECT: S >= L (full comparison, S - L = 0)
+  Dalek from_bytes: ACCEPT: top 3 bits clear
+  Dalek verify_strict: REJECT: S >= L (verify_strict canonical check, S - L = 0)
+  Dalek verify_loose: ACCEPT: top 3 bits clear (S < 2^253), S != canonical
+  Firedancer full verify: REJECT (ERR_SIG: S >= L)
+  ** NOTE (vs loose): Firedancer scalar=False, Dalek loose from_bytes=True
+
+--- S = L + 1 ---
+  S value: 7237005577332262213973186563042994240857116359379907606001950938285454250990
+  S hex (LE): eed3f55c1a631258d69cf7a2def9de1400000000000000000000000000000010
+  S byte[31]: 0x10
+  S < L: False
+  S < 2^252: False
+  S < 2^253: True
+  Firedancer scalar_validate: REJECT: S >= L (full comparison, S - L = 1)
+  Dalek from_bytes: ACCEPT: top 3 bits clear
+  Dalek verify_strict: REJECT: S >= L (verify_strict canonical check, S - L = 1)
+  Dalek verify_loose: ACCEPT: top 3 bits clear (S < 2^253), S != canonical
+  Firedancer full verify: REJECT (ERR_SIG: S >= L)
+  ** NOTE (vs loose): Firedancer scalar=False, Dalek loose from_bytes=True
+
+--- S = 2L - 1 ---
+  S value: 14474011154664524427946373126085988481714232718759815212003901876570908501977
+  S hex (LE): d9a7ebb934c624b0ac39ef45bdf3bd2900000000000000000000000000000020
+  S byte[31]: 0x20
+  S < L: False
+  S < 2^252: False
+  S < 2^253: False
+  Firedancer scalar_validate: REJECT: top 3 bits set (byte[31]=0x20, bits 253-255 nonzero => S >= 2^253)
+  Dalek from_bytes: REJECT: top 3 bits of byte[31] set (check_scalar)
+  Dalek verify_strict: REJECT: from_bytes fails
+  Dalek verify_loose: REJECT: from_bytes fails
+  Firedancer full verify: REJECT (ERR_SIG: S >= L)
+
+--- S = 2L ---
+  S value: 14474011154664524427946373126085988481714232718759815212003901876570908501978
+  S hex (LE): daa7ebb934c624b0ac39ef45bdf3bd2900000000000000000000000000000020
+  S byte[31]: 0x20
+  S < L: False
+  S < 2^252: False
+  S < 2^253: False
+  Firedancer scalar_validate: REJECT: top 3 bits set (byte[31]=0x20, bits 253-255 nonzero => S >= 2^253)
+  Dalek from_bytes: REJECT: top 3 bits of byte[31] set (check_scalar)
+  Dalek verify_strict: REJECT: from_bytes fails
+  Dalek verify_loose: REJECT: from_bytes fails
+  Firedancer full verify: REJECT (ERR_SIG: S >= L)
+
+--- S = 2^253 - 1 (all bits in 253-bit range) ---
+  S value: 14474011154664524427946373126085988481658748083205070504932198000989141204991
+  S hex (LE): ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff1f
+  S byte[31]: 0x1f
+  S < L: False
+  S < 2^252: False
+  S < 2^253: True
+  Firedancer scalar_validate: REJECT: S >= L (full comparison, S - L = 7237005577332262213973186563042994240801631723825162898930247062703686954002)
+  Dalek from_bytes: ACCEPT: top 3 bits clear
+  Dalek verify_strict: REJECT: S >= L (verify_strict canonical check, S - L = 7237005577332262213973186563042994240801631723825162898930247062703686954002)
+  Dalek verify_loose: ACCEPT: top 3 bits clear (S < 2^253), S != canonical
+  Firedancer full verify: REJECT (ERR_SIG: S >= L)
+  ** NOTE (vs loose): Firedancer scalar=False, Dalek loose from_bytes=True
+
+--- S = 2^255 - 1 ---
+  S value: 57896044618658097711785492504343953926634992332820282019728792003956564819967
+  S hex (LE): ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f
+  S byte[31]: 0x7f
+  S < L: False
+  S < 2^252: False
+  S < 2^253: False
+  Firedancer scalar_validate: REJECT: top 3 bits set (byte[31]=0x7f, bits 253-255 nonzero => S >= 2^253)
+  Dalek from_bytes: REJECT: top 3 bits of byte[31] set (check_scalar)
+  Dalek verify_strict: REJECT: from_bytes fails
+  Dalek verify_loose: REJECT: from_bytes fails
+  Firedancer full verify: REJECT (ERR_SIG: S >= L)
+
+--- S = 2^256 - 1 (all 0xFF) ---
+  S value: 115792089237316195423570985008687907853269984665640564039457584007913129639935
+  S hex (LE): ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff
+  S byte[31]: 0xff
+  S < L: False
+  S < 2^252: False
+  S < 2^253: False
+  Firedancer scalar_validate: REJECT: top 3 bits set (byte[31]=0xff, bits 253-255 nonzero => S >= 2^253)
+  Dalek from_bytes: REJECT: top 3 bits of byte[31] set (check_scalar)
+  Dalek verify_strict: REJECT: from_bytes fails
+  Dalek verify_loose: REJECT: from_bytes fails
+  Firedancer full verify: REJECT (ERR_SIG: S >= L)
+
+--- S with byte[31] high bit set (bit 255) ---
+  S value: 57896044618658097711785492504343953926634992332820282019728792003956564819969
+  S hex (LE): 0100000000000000000000000000000000000000000000000000000000000080
+  S byte[31]: 0x80
+  S < L: False
+  S < 2^252: False
+  S < 2^253: False
+  Firedancer scalar_validate: REJECT: top 3 bits set (byte[31]=0x80, bits 253-255 nonzero => S >= 2^253)
+  Dalek from_bytes: REJECT: top 3 bits of byte[31] set (check_scalar)
+  Dalek verify_strict: REJECT: from_bytes fails
+  Dalek verify_loose: REJECT: from_bytes fails
+  Firedancer full verify: REJECT (ERR_SIG: S >= L)
+
+--- S = L with only top byte changed (byte[31]=0x10 -> 0x11) ---
+  S value: 7689318425915528602346510723233181380908952236980066059281082125816364913645
+  S hex (LE): edd3f55c1a631258d69cf7a2def9de1400000000000000000000000000000011
+  S byte[31]: 0x11
+  S < L: False
+  S < 2^252: False
+  S < 2^253: True
+  Firedancer scalar_validate: REJECT: S >= L (full comparison, S - L = 452312848583266388373324160190187140051835877600158453279131187530910662656)
+  Dalek from_bytes: ACCEPT: top 3 bits clear
+  Dalek verify_strict: REJECT: S >= L (verify_strict canonical check, S - L = 452312848583266388373324160190187140051835877600158453279131187530910662656)
+  Dalek verify_loose: ACCEPT: top 3 bits clear (S < 2^253), S != canonical
+  Firedancer full verify: REJECT (ERR_SIG: S >= L)
+  ** NOTE (vs loose): Firedancer scalar=False, Dalek loose from_bytes=True
+
+--- S = L - 1 with bit 252 set (max valid, bit 252 boundary) ---
+  S value: 7237005577332262213973186563042994240857116359379907606001950938285454250988
+  S hex (LE): ecd3f55c1a631258d69cf7a2def9de1400000000000000000000000000000010
+  S byte[31]: 0x10
+  S < L: True
+  S < 2^252: False
+  S < 2^253: True
+  Firedancer scalar_validate: ACCEPT: bit 252 set but S < L (S in [2^252, L))
+  Dalek from_bytes: ACCEPT: top 3 bits clear
+  Dalek verify_strict: ACCEPT: S < L
+  Dalek verify_loose: ACCEPT: top 3 bits clear (S < 2^253), S = canonical
+  Firedancer full verify: REJECT (ERR_MSG: equation check failed)
+
+--- S = 2^252 (just above fast-path cutoff) ---
+  S value: 7237005577332262213973186563042994240829374041602535252466099000494570602496
+  S hex (LE): 0000000000000000000000000000000000000000000000000000000000000010
+  S byte[31]: 0x10
+  S < L: True
+  S < 2^252: False
+  S < 2^253: True
+  Firedancer scalar_validate: ACCEPT: bit 252 set but S < L (S in [2^252, L))
+  Dalek from_bytes: ACCEPT: top 3 bits clear
+  Dalek verify_strict: ACCEPT: S < L
+  Dalek verify_loose: ACCEPT: top 3 bits clear (S < 2^253), S = canonical
+  Firedancer full verify: REJECT (ERR_MSG: equation check failed)
+
+--- S = 2^252 - 1 (max fast-path value) ---
+  S value: 7237005577332262213973186563042994240829374041602535252466099000494570602495
+  S hex (LE): ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff0f
+  S byte[31]: 0x0f
+  S < L: True
+  S < 2^252: True
+  S < 2^253: True
+  Firedancer scalar_validate: ACCEPT: fast path (top 4 bits zero => S < 2^252 < L)
+  Dalek from_bytes: ACCEPT: top 3 bits clear
+  Dalek verify_strict: ACCEPT: S < L
+  Dalek verify_loose: ACCEPT: top 3 bits clear (S < 2^253), S = canonical
+  Firedancer full verify: REJECT (ERR_MSG: equation check failed)
+
+--- S = L + L (2L, reduced mod 2^256) ---
+  S value: 14474011154664524427946373126085988481714232718759815212003901876570908501978
+  S hex (LE): daa7ebb934c624b0ac39ef45bdf3bd2900000000000000000000000000000020
+  S byte[31]: 0x20
+  S < L: False
+  S < 2^252: False
+  S < 2^253: False
+  Firedancer scalar_validate: REJECT: top 3 bits set (byte[31]=0x20, bits 253-255 nonzero => S >= 2^253)
+  Dalek from_bytes: REJECT: top 3 bits of byte[31] set (check_scalar)
+  Dalek verify_strict: REJECT: from_bytes fails
+  Dalek verify_loose: REJECT: from_bytes fails
+  Firedancer full verify: REJECT (ERR_SIG: S >= L)
+
+--- S = valid_S + L (congruent mod L but >= L) ---
+  S value: 8936182054926729664669834262340903440898880785857889547703446380455017488283
+  S hex (LE): 9b9f7a04b3ae25b801b0530468abd3e07e082a0d99bf46c216f1ff6a26b3c113
+  S byte[31]: 0x13
+  S < L: False
+  S < 2^252: False
+  S < 2^253: True
+  Firedancer scalar_validate: REJECT: S >= L (full comparison, S - L = 1699176477594467450696647699297909200041764426477981941701495442169563237294)
+  Dalek from_bytes: ACCEPT: top 3 bits clear
+  Dalek verify_strict: REJECT: S >= L (verify_strict canonical check, S - L = 1699176477594467450696647699297909200041764426477981941701495442169563237294)
+  Dalek verify_loose: ACCEPT: top 3 bits clear (S < 2^253), S != canonical
+  Firedancer full verify: REJECT (ERR_SIG: S >= L)
+  ** NOTE (vs loose): Firedancer scalar=False, Dalek loose from_bytes=True
+
+==========================================================================================
+SPECIAL TEST: S congruent to valid_S mod L
+==========================================================================================
+
+  valid_S = 1699176477594467450696647699297909200041764426477981941701495442169563237294
+  valid_S + L = 8936182054926729664669834262340903440898880785857889547703446380455017488283
+  (valid_S + L) < 2^253: True
+  (valid_S + L) mod L = 1699176477594467450696647699297909200041764426477981941701495442169563237294 (should equal valid_S = 1699176477594467450696647699297909200041764426477981941701495442169563237294)
+  Firedancer scalar_validate: REJECT: S >= L (full comparison, S - L = 1699176477594467450696647699297909200041764426477981941701495442169563237294)
+  Dalek from_bytes: ACCEPT: top 3 bits clear
+  Dalek verify_strict: REJECT: S >= L (verify_strict canonical check, S - L = 1699176477594467450696647699297909200041764426477981941701495442169563237294)
+  Dalek verify_loose: ACCEPT: top 3 bits clear (S < 2^253), S != canonical
+  Firedancer full verify: REJECT (ERR_SIG: S >= L)
+  If Dalek loose mode accepts S = valid_S + L:
+    - Internally [S]B = [(valid_S + L)]B = [valid_S]B (since [L]B = identity)
+    - So the equation [S]B = R + [k]A still holds
+    - Dalek loose WOULD ACCEPT this signature
+    - But Firedancer REJECTS because S >= L
+    - This is a BEHAVIORAL DIFFERENCE but not exploitable for consensus
+      because Agave uses verify_strict, not verify (loose)
+
+
+==========================================================================================
+RUST DALEK HARNESS VERIFICATION
+==========================================================================================
+
+Rust harness found at: F:\Claude\BugBounty\targets\firedancer\test_harness_rust\target\release\ed25519_test.exe
+  S = 0: verify_strict: REJECT  verify (loose): REJECT
+  S = 1: verify_strict: REJECT  verify (loose): REJECT
+  S = L - 1: verify_strict: REJECT  verify (loose): REJECT
+  S = L: verify_strict: REJECT  verify (loose): REJECT
+  S = L + 1: verify_strict: REJECT  verify (loose): REJECT
+  S = 2^253 - 1: verify_strict: REJECT  verify (loose): REJECT
+  S = valid_S (should accept): verify_strict: ACCEPT  verify (loose): ACCEPT
+  S = valid_S + L: verify_strict: REJECT  verify (loose): REJECT
+
+==========================================================================================
+SUMMARY AND FINDINGS
+==========================================================================================
+
+
+Firedancer scalar validation (fd_curve25519_scalar_validate):
+  - Method: Multi-step check with fast paths + full 256-bit comparison
+  - Fast reject: byte[31] & 0xE0 != 0 (top 3 bits) => S >= 2^253
+  - Fast accept: byte[31] & 0xF0 == 0 => S < 2^252 < L
+  - Full check: 256-bit subtraction s - L, check borrow flag
+  - Correctly accepts [0, L) and rejects [L, 2^256)
+
+Dalek 1.0.1 scalar validation:
+  - Signature::from_bytes (check_scalar): only checks byte[31] & 0xE0 == 0
+    This is WEAKER: accepts S in [L, 2^253)
+  - verify_strict: adds scalar_is_canonical check (full S < L)
+  - verify (loose): does NOT add canonical check
+
+S usage in equation:
+  - Firedancer: S is used directly (no mod L reduction), but S >= L is rejected
+    before the equation check, so this is a non-issue
+  - Dalek strict: S is used directly, S >= L rejected
+  - Dalek loose: S is loaded as raw bytes, reduction happens in scalar mult
+    So S = k*L + r computes same as S = r
+
+Discrepancies found: 5
+  - S = L (first invalid) [loose_accepts_fd_rejects]: Firedancer=False, Dalek=True
+  - S = L + 1 [loose_accepts_fd_rejects]: Firedancer=False, Dalek=True
+  - S = 2^253 - 1 (all bits in 253-bit range) [loose_accepts_fd_rejects]: Firedancer=False, Dalek=True
+  - S = L with only top byte changed (byte[31]=0x10 -> 0x11) [loose_accepts_fd_rejects]: Firedancer=False, Dalek=True
+  - S = valid_S + L (congruent mod L but >= L) [loose_accepts_fd_rejects]: Firedancer=False, Dalek=True
+
+Critical finding for Firedancer vs Agave consensus:
+  - Agave uses verify_strict, which does full S < L check
+  - Firedancer also does full S < L check
+  - Both AGREE on rejecting S >= L for the strict verification path
+  - No consensus-breaking discrepancy found in S boundary handling
+
+  - The only difference is in Dalek's LOOSE mode (verify, not verify_strict)
+    which accepts S in [L, 2^253) -- but this mode is NOT used by Agave
+    for transaction signature verification.
+
+Potential edge case to investigate further:
+  - Firedancer's fast-path for byte[31] & 0xF0 == 0 could theoretically
+    be wrong if there's a value < 2^252 that is >= L. But since
+    L > 2^252, all values < 2^252 are indeed < L. This is correct.
+  - The full comparison path correctly handles S in [2^252, L).

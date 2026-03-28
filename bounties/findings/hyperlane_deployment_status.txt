@@ -1,0 +1,183 @@
+================================================================================
+HYPERLANE WeightedMultisigIsm - DEPLOYMENT STATUS INVESTIGATION
+================================================================================
+Date: 2026-03-27
+Purpose: Determine if WeightedMultisigIsm is deployed on mainnet for bug bounty
+
+================================================================================
+1. SUMMARY
+================================================================================
+
+FINDING: WeightedMultisigIsm FACTORIES are deployed on 124 mainnet chains.
+However, the factories themselves are NOT the vulnerable code -- they are
+deployment infrastructure. The question is whether any ISM INSTANCES created
+by these factories are actively used to secure message delivery.
+
+KEY DISTINCTION:
+  - Factory contracts (StaticMerkleRootWeightedMultisigIsmFactory,
+    StaticMessageIdWeightedMultisigIsmFactory) = deployed on 124 chains
+  - ISM instances (created by factories for specific validator sets) =
+    no evidence of active use in Hyperlane's own default ISM configurations
+
+================================================================================
+2. FACTORY DEPLOYMENTS (CONFIRMED ON MAINNET)
+================================================================================
+
+Factories are deployed as part of Hyperlane's standard ISM infrastructure on
+every chain where Hyperlane operates. Each chain gets 4 weighted contracts:
+
+  1. StaticMerkleRootWeightedMultisigIsmFactory (factory)
+  2. StaticMerkleRootWeightedMultisigIsm (proxy/template)
+  3. StaticMessageIdWeightedMultisigIsmFactory (factory)
+  4. StaticMessageIdWeightedMultisigIsm (proxy/template)
+
+Sample addresses (Ethereum mainnet):
+  - MerkleRootWeightedFactory:  0xA2502bF73e5313c1bf48E47C887cdcbf2640FA41
+  - MerkleRootWeightedIsm:      0x834e00bc940d239c3A3b13413cDFBa205f1B22fb (proxy)
+  - MessageIdWeightedFactory:   0x4272124Fba59CbA076D85375895f94B6a3485c3E
+  - MessageIdWeightedIsm:       0x16c0Dbb3CAfF177a45C79023379803519EF59da9 (proxy)
+
+Other major chains with verified deployments:
+  - Arbitrum, Avalanche, Base, BSC, Celo, Gnosis, Moonbeam, Optimism, Polygon
+  - Plus 115 additional chains (see mainnet3/ism/verification.json)
+
+First factory deployment: August 27, 2024 (commit 330d302a6)
+Source: typescript/infra/config/environments/mainnet3/ism/verification.json
+
+================================================================================
+3. ACTIVE ISM USAGE STATUS
+================================================================================
+
+CRITICAL FINDING: No evidence that Hyperlane's own mainnet configurations
+use WeightedMultisigIsm as the default or routing ISM for any chain.
+
+Evidence:
+  a) The mainnet3 TypeScript infra config (*.ts files) contains ZERO references
+     to IsmType.WEIGHTED_MERKLE_ROOT_MULTISIG or IsmType.WEIGHTED_MESSAGE_ID_MULTISIG
+  b) WeightedMultisig ISM types are ONLY referenced in the test environment config:
+     typescript/infra/config/environments/test/multisigIsm.ts
+  c) The rust mainnet_config.json lists interchainSecurityModule addresses for
+     each chain, but these point to regular MultisigIsm or routing ISM instances,
+     not weighted variants
+
+HOWEVER: Third-party applications can deploy their own WeightedMultisigIsm
+instances using the deployed factories. Hyperlane's architecture allows any
+app to specify a custom ISM. We cannot determine from the repo alone whether
+third-party warp routes or dApps use weighted multisig ISMs.
+
+================================================================================
+4. GIT HISTORY ANALYSIS
+================================================================================
+
+Timeline:
+  2024-07-02  First WeightedMultisigIsm contracts committed (8738d82d2)
+  2024-08-27  Factory deployment to mainnet (330d302a6, #4377)
+  2024-08-27  Additional factory deploys (7a0efca88)
+  2024-10-22  CRITICAL BUG FIX: duplicate signature bypass (#4468, 2760da1de)
+              - Chainlight audit finding
+              - Commit message states: "We haven't deployed these contracts
+                yet on testnet/mainnet" (referring to ISM instances, not factories)
+              - The fix added ++validatorIndex to prevent same signer reuse
+  2024-10-22  Relayer support reverted then re-added (#4360, #4399)
+  2024-11-XX  SDK support added (#4331)
+  2025-04-24  Cleanup of unused imports (#5997)
+
+The Chainlight duplicate-sig fix commit (#4468) explicitly confirms that as of
+October 2024, no WeightedMultisigIsm instances were deployed on mainnet. The
+factories existed but no validator sets had been created through them by
+Hyperlane's own infrastructure.
+
+================================================================================
+5. THE VALIDATOR MATCHING BOUND BUG (from our recon)
+================================================================================
+
+Our previously identified bug (Section 4.2 of hyperlane_recon.txt):
+  - _validatorCount = min(validators.length, signatureCount)
+  - Validators beyond index signatureCount are never checked
+  - Valid quorums can be rejected if matching validators are at high indices
+
+This bug is SEPARATE from the Chainlight fix. The Chainlight fix addressed
+duplicate signature replay. Our bug addresses the loop bound limiting which
+validators can be matched.
+
+IMPACT ASSESSMENT FOR BUG BOUNTY:
+  - If no WeightedMultisigIsm instances are actively securing value on mainnet,
+    this is a code-level bug but not exploitable in production
+  - The bug would be classified as DoS (false rejection of valid signatures),
+    not a security bypass (false acceptance of invalid signatures)
+  - Severity would be LOW if no deployed instances exist, MEDIUM if they do
+  - Third-party usage is unknown and could elevate severity
+
+================================================================================
+6. IMMUNEFI SCOPE ASSESSMENT
+================================================================================
+
+From hyperlane_recon.txt:
+  - AbstractWeightedMultisigIsm.sol IS listed as a key file in the bounty scope
+  - The Immunefi program covers "222 assets across Arbitrum, Avalanche, Base,
+    BSC, Celo, Ethereum, Gnosis, Moonbeam, Optimism, Polygon"
+  - Factory contracts ARE deployed on all in-scope chains
+  - The contracts are NOT marked as experimental/beta in the source code
+
+Immunefi typically requires:
+  - Proof of on-chain impact
+  - Deployed contract addresses affected
+  - Working PoC
+
+For this bug: The factories are deployed, but whether ISM instances are
+actively used is the key question for bounty eligibility.
+
+================================================================================
+7. RECOMMENDATIONS FOR BUG BOUNTY SUBMISSION
+================================================================================
+
+OPTION A: Submit as code-level bug (likely LOW severity, $2,000)
+  - Report the validator matching bound error
+  - Note that factories are deployed on 124 mainnet chains
+  - Acknowledge that active instance usage is unconfirmed
+  - Provide PoC showing valid weighted quorum rejection
+  - Risk: may be rejected as "not deployed" or "informational"
+
+OPTION B: Verify on-chain usage first (stronger submission)
+  - Query the factory contracts on Ethereum mainnet via Etherscan
+  - Check if any ISM instances have been created by calling the factory
+  - Look for events emitted by StaticWeightedValidatorSetFactory
+  - Check if any Hyperlane warp routes use weighted ISMs
+  - If instances exist with value at risk, severity increases to MEDIUM-HIGH
+
+OPTION C: Combine with other findings
+  - Bundle the validator matching bug with the broader weighted ISM analysis
+  - Include the fact that the Chainlight fix only addressed duplicate sigs,
+    not the loop bound issue
+  - Position as a defense-in-depth improvement for production readiness
+
+RECOMMENDED NEXT STEPS:
+  1. Query Etherscan for factory event logs to find created instances
+  2. Check Hyperlane Explorer for any messages verified by weighted ISMs
+  3. Search for third-party Hyperlane integrations using weighted multisig
+  4. If instances found, build targeted PoC with those specific parameters
+
+================================================================================
+8. KEY FILE REFERENCES
+================================================================================
+
+Contracts:
+  solidity/contracts/isms/multisig/AbstractWeightedMultisigIsm.sol
+  solidity/contracts/isms/multisig/WeightedMultisigIsm.sol
+  solidity/contracts/interfaces/isms/IWeightedMultisigIsm.sol
+  solidity/contracts/libs/StaticWeightedValidatorSetFactory.sol
+
+Deployment configs:
+  typescript/infra/config/environments/mainnet3/ism/verification.json
+  rust/main/config/mainnet_config.json
+
+Test configs (only place WeightedMultisig ISM types are actively configured):
+  typescript/infra/config/environments/test/multisigIsm.ts
+
+SDK:
+  typescript/sdk/src/ism/HyperlaneIsmFactory.ts (deployWeightedMultisigIsm)
+  typescript/sdk/src/ism/types.ts (WeightedMultisigIsmConfig)
+
+================================================================================
+END OF DEPLOYMENT STATUS REPORT
+================================================================================

@@ -1,0 +1,245 @@
+================================================================================
+SCOPE VERIFICATION - Firedancer Bug Bounty (Immunefi)
+================================================================================
+Date: 2026-03-28
+URL: https://immunefi.com/bug-bounty/firedancer/scope/
+Info: https://immunefi.com/bug-bounty/firedancer/information/
+Program Live Since: September 18, 2024
+Last Updated: January 28, 2026
+Model: Primacy of Rules
+
+================================================================================
+IN-SCOPE ASSETS
+================================================================================
+
+Single asset: "Firedancer Latest Mainnet Release"
+  - Repository: https://github.com/firedancer-io/firedancer/releases
+  - Scope definition: "Code linked into and reachable from this binary in the
+    latest Frankendancer release build"
+  - Primary command: fdctl run
+  - FFI interface between Frankendancer and Agave: IN SCOPE
+  - GUI (HTTP port): IN SCOPE
+  - Sigverify tile (Ed25519 verification): IN SCOPE - explicitly called out
+    by the team as a high-value target area
+
+NOT in scope:
+  - Full Firedancer (non-Frankendancer) findings = informational only
+  - Code in development but not executed: src/flamenco/runtime/, src/ballet/sbpf/
+  - Agave validator bugs (report to Anza)
+  - Solana protocol design flaws (report to Anza)
+  - Tiles in Agave address space: bank, poh, store, pack-to-bank transitions
+
+================================================================================
+IN-SCOPE IMPACTS (by severity)
+================================================================================
+
+CRITICAL ($100,000 - $500,000):
+  - Any bug leading to loss of funds or acceptance of forged/invalid signatures
+  - Key compromise/exfiltration exploit chain
+  - Network not being able to confirm new transactions (total network shutdown)
+  - Unintended permanent chain split requiring hard fork
+  - Direct loss of funds
+  - Permanent freezing of funds (fix requires hard fork)
+  - Infinite Mint
+
+HIGH ($50,000 - $100,000):
+  - Unintended chain split (network partition)
+  - Temporary freezing of network transactions (500%+ block time delay)
+  - Liveness issues causing Firedancer validators to crash or be unavailable
+  - Elevate privileges in Firedancer GitHub repo to cut releases
+  - Any sandbox escape
+
+MEDIUM ($5,000 - $50,000):
+  - Process-to-process RCE between sandboxed tiles
+  - Increasing network processing node resource consumption by at least 30%
+  - Shutdown of >= 30% of network processing nodes
+  - Any bug leading Firedancer to produce an invalid block or skip leader slot
+  - Consensus issues causing Firedancer validators to fork
+  - CI runner persistence and privilege escalations
+
+LOW ($5,000 fixed):
+  - Smart contract behavior bugs with no concrete funds at risk
+  - Modification of transaction fees outside design parameters
+
+KEY NOTE: For cluster-level impact, a theoretical Firedancer-only chain is in
+scope. You may assume a 100% Firedancer validator set and demonstrate impacts
+such as chain halt or chain split under those conditions.
+
+================================================================================
+EXCLUSIONS
+================================================================================
+
+Code exclusions:
+  - Full Firedancer (non-Frankendancer) = informational only
+  - Agave validator bugs
+  - Solana protocol design flaws
+  - Tiles in Agave address space (bank, poh, store)
+
+Attack type exclusions:
+  - Purely local validator issues (command-line/env handling)
+  - Phishing/social engineering
+  - 51% attacks, Sybil attacks, oracle manipulation without code bugs
+  - Attacks using leaked credentials or privileged addresses
+  - Requires access to non-production secrets/API keys
+  - Pre-existing OS compromise
+  - Mainnet/testnet testing (local forks only)
+
+Other exclusions:
+  - Feature requests, best practice recommendations
+  - Test/configuration file impacts only
+  - Block engine vulnerabilities = lower severity assessment
+  - Multiple bugs with same root cause = treated as one bug
+
+================================================================================
+KNOWN ISSUES / PRIOR WORK
+================================================================================
+
+Known issue sources (bugs matching these are INELIGIBLE):
+  1. Firedancer Boost program findings
+  2. GitHub issues/PRs: https://github.com/firedancer-io/firedancer/issues
+  3. Completed audit reports: https://github.com/firedancer-io/audits
+  4. Any unfixed vulnerabilities in prior audits
+
+CRITICAL - GitHub Issue #38: "sigverify: match dalek verify_strict"
+  - Status: CLOSED (June 28, 2023) via PR #471
+  - Problem: Firedancer's SigVerify (derived from OpenSSL) was more permissive
+    than ed25519-dalek verify_strict
+  - Fix: Added small-order point rejection for R and A (public key)
+    - Added fd_ed25519_ge_p3_mul_by_pow_2 to check [8]P = identity
+    - Added fd_ed25519_ge_p3_is_identity
+  - IMPLICATION: The general category of "match dalek verify_strict" is a
+    KNOWN ISSUE that was addressed. However, the fix may be incomplete --
+    specific edge cases NOT covered by PR #471 could still be valid findings.
+
+Audit reports on file:
+  1. Atredis Partners - Firedancer v0.1 Audit
+  2. Cure53 - GUI & HTTP Audit
+  3. Cure53 - firedancer-metrics audit
+  4. Neodyme - Firedancer v0.1 Audit
+  5. Neodyme - Firedancer v0.4 Audit
+
+Neodyme audit findings (Ed25519-relevant):
+  - Signatures verified in Firedancer are malleable, but non-malleability is not
+    required by employed protocols (not a security issue)
+  - ed25519 sign function takes pubkey/privkey separately without correspondence
+    check, but Sign Tile has explicit check (mitigated)
+
+================================================================================
+POC REQUIREMENTS
+================================================================================
+
+  - PoC is REQUIRED for all severities
+  - Must comply with Immunefi PoC Guidelines and Rules
+  - For RCE: actual proof of RCE expected
+  - Memory corruptions as building blocks = lower rewards than full RCE
+  - Validator code patches in PoCs must be minimized
+  - Must explain exploitation feasibility
+  - All testing on local forks only (no mainnet/testnet)
+  - KYC required for payout (full name, DOB, proof of address, gov ID)
+  - Category 3 responsible publication (approval required before disclosure)
+
+================================================================================
+OUR FINDING STATUS: Ed25519 Consensus-Splitting Bug
+================================================================================
+
+Target file: src/ballet/ed25519/fd_ed25519_user.c
+  - Part of src/ballet/ed25519/ (the "ballet" library)
+  - Used by the Sigverify tile in Frankendancer
+  - Linked into the fdctl binary
+
+ASSET IN SCOPE?  YES
+  - src/ballet/ed25519/ is part of the Frankendancer release build
+  - The Sigverify tile is explicitly called out by the team as a target
+  - Ed25519 code is reachable from the fdctl run command path
+  - The team specifically noted: "Cryptographic integrity is crucial for the
+    security of the entire blockchain. If you specialize in cryptography,
+    this section offers high potential for finding impactful bugs."
+
+IMPACT IN SCOPE?  YES
+  - "Any bug leading to loss of funds or acceptance of forged/invalid
+    signatures" = CRITICAL ($100K-$500K)
+  - "Unintended permanent chain split requiring hard fork" = CRITICAL
+  - "Unintended chain split (network partition)" = HIGH ($50K-$100K)
+  - "Consensus issues causing Firedancer validators to fork" = MEDIUM ($5K-$50K)
+  - A consensus split between Firedancer and Agave due to Ed25519 verification
+    disagreement maps to HIGH or CRITICAL severity
+  - We may assume a 100% Firedancer validator set for impact demonstration
+
+KNOWN ISSUE?  PARTIALLY
+  - Issue #38 (closed June 2023) addressed the general category of matching
+    dalek verify_strict, specifically adding small-order rejection for R and A
+  - PR #471 added [8]P = identity checks
+  - HOWEVER: Our specific hypotheses target edge cases that may NOT have been
+    addressed by PR #471:
+      * H1: Cofactor equation mismatch (cofactored vs cofactorless)
+      * H3: Small-order point detection differences (non-canonical encodings
+             of small-order points, y >= p forms)
+      * H4: S reduction boundary edge cases
+      * H5: Precompile vs sigverify path differences
+      * H6: AVX512 vs reference implementation divergence
+  - If we find a SPECIFIC edge case where Firedancer and Dalek disagree that
+    was NOT covered by PR #471, this would be a NEW finding, not a duplicate
+
+READY TO SUBMIT?  NO - NOT YET
+  - H2 (non-canonical R encoding) tested and did NOT produce divergence
+  - Remaining hypotheses H1, H3, H4, H5, H6 still need testing
+  - We need a concrete PoC showing actual divergence before submitting
+  - No verified consensus-splitting input exists yet
+
+================================================================================
+RISK ASSESSMENT FOR DUPLICATE/KNOWN ISSUE REJECTION
+================================================================================
+
+RISK: MODERATE
+
+The main risk is that the Firedancer team could claim our finding is related to
+the known Issue #38. However, per Immunefi Primacy of Rules:
+
+  "To ensure fairness, Firedancer is prohibited from claiming a bug report is
+   a known or duplicate issue without providing clear and verifiable evidence.
+   Without such evidence, the bug report will be considered valid and eligible
+   for the appropriate reward."
+
+MITIGATION STRATEGY:
+  1. Our PoC must demonstrate a SPECIFIC input that causes divergence
+  2. We must show this specific case was NOT addressed by PR #471
+  3. We should reference the PR #471 changes and explain why they are
+     insufficient for our specific edge case
+  4. We should test against the LATEST release, not historical versions
+
+================================================================================
+NEXT STEPS
+================================================================================
+
+Priority testing order:
+  1. H1 - Cofactor equation mismatch (speccheck vector 4)
+     - Test if Firedancer uses cofactored [8][S]B = [8]R + [8][k]A
+       vs Dalek's cofactorless [S]B = R + [k]A in verify_strict
+     - This is the MOST LIKELY to produce divergence
+
+  2. H3 - Small-order point detection with non-canonical encodings
+     - Test all 14 known small-order point encodings
+     - Test non-canonical (y >= p) encodings of small-order points
+     - Check if PR #471's [8]P = identity check handles all cases
+
+  3. H6 - AVX512 vs reference implementation divergence
+     - Compare fd_ed25519_verify output between ref and avx512 backends
+     - Edge cases in field arithmetic (carry propagation, reduction)
+
+  4. H4 - S reduction boundary
+     - Test S values near L (curve order)
+     - Test S = L, S = L+1, S = 2L, etc.
+
+  5. H5 - Precompile vs sigverify path differences
+     - Compare fd_ed25519_verify (sigverify tile) vs precompile path
+     - Check src/flamenco/runtime/program/fd_precompiles.c
+
+ESTIMATED SEVERITY IF CONFIRMED:
+  - Consensus split (Firedancer accepts, Agave rejects or vice versa) = HIGH
+    to CRITICAL depending on exploitability
+  - If an attacker can craft transactions that only one validator accepts,
+    this enables chain split = CRITICAL ($100K-$500K)
+
+================================================================================
+END OF SCOPE VERIFICATION
+================================================================================
