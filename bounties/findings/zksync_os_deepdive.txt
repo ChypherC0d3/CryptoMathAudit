@@ -1,0 +1,534 @@
+===============================================================================
+ZKSYNC OS / AIRBENDER DEEP DIVE - STARK/FRI PROOF SYSTEM
+Date: 2026-03-28
+Target: https://github.com/matter-labs/zksync-airbender
+===============================================================================
+
+SCOPE VERIFICATION (Immunefi: https://immunefi.com/bug-bounty/zksync-os/information/)
+==================
+- Program: ZKsync OS Bug Bounty
+- 84 in-scope assets across zksync-airbender, zksync-os, zkos-wrapper repos
+- Airbender proof system circuits, verifier components, FRI folding: IN SCOPE
+- Rewards: Critical $30k-$100k, High $20k flat, Medium $5k flat
+- Intentionally-planted Medium bug exists (first valid report wins)
+- "Primacy of Impact" policy: even out-of-scope assets can qualify
+- High impact: "Underconstraints in the circuit that make invalid ZKsync OS
+  executions provable" or "mismatches that make valid executions unprovable"
+
+Key in-scope impacts:
+  Critical: Direct and publicly triggerable loss of funds
+  High: Under-constrained circuits allowing invalid proofs; mismatches blocking valid proofs
+  Medium: Undocumented EVM behavior deviation
+
+===============================================================================
+FINDING 1: UNSOUND coeffs_in_base() IN Mersenne31Complex -- CRITICAL UB
+===============================================================================
+FILE: F:\Claude\BugBounty\targets\zksync\zksync-airbender\field\src\complex.rs
+LINE: 513
+SEVERITY: Medium (UB / potential soundness issue)
+IN SCOPE: YES
+
+DESCRIPTION:
+The FieldExtension<Mersenne31Field> impl for Mersenne31Complex has this code
+for coeffs_in_base():
+
+    fn coeffs_in_base(&self) -> &[Mersenne31Field] {
+        unsafe { core::slice::from_raw_parts(self.c0.0 as *const Mersenne31Field, 2) }
+    }
+
+This reinterprets the *value* of self.c0.0 (a u32 field element value) as a
+*pointer address*, then creates a slice from that address. This is undefined
+behavior: self.c0.0 is the numeric value of the first coefficient (e.g., 311014874),
+not a memory address. Reading from address 311014874 is a wild pointer dereference.
+
+The correct implementation should be:
+    unsafe { core::slice::from_raw_parts(&self.c0 as *const Mersenne31Field, 2) }
+
+IMPACT:
+If this function is called on any non-trivial Mersenne31Complex, it will produce
+garbage data or crash. In the verifier context, this could lead to incorrect
+proof verification if the function were used in a code path that processes
+extension field elements during verification.
+
+However, examining the codebase, this specific function appears to NOT be called
+in the hot verification path -- the verifier uses into_coeffs_in_base() (which
+copies) rather than coeffs_in_base() (which borrows). The Mersenne31Quartic
+FieldExtension<Mersenne31Complex> impl also uses todo!() for coeffs_in_base(),
+suggesting these borrow-based methods are not exercised.
+
+POC FEASIBILITY: Yes -- trivially demonstrable by calling coeffs_in_base() on
+any Mersenne31Complex value. However, exploitation in the verifier requires
+finding a code path that calls this method.
+
+STATUS: Likely a latent bug / code quality issue. Not currently exploitable in
+the verifier, but dangerous if code evolves to use this method.
+
+===============================================================================
+FINDING 2: to_le_bytes() DOES NOT REDUCE FIELD ELEMENT (NON-CANONICAL SERIALIZATION)
+===============================================================================
+FILE: F:\Claude\BugBounty\targets\zksync\zksync-airbender\field\src\base.rs
+LINE: 549-550
+SEVERITY: Low
+IN SCOPE: YES
+
+DESCRIPTION:
+Without the "use_division" feature, Mersenne31Field stores values in range
+[0, 2^31-1] where both 0 and 2^31-1 represent zero. The to_le_bytes() method:
+
+    fn to_le_bytes(self) -> [u8; Self::NUM_BYTES_IN_REPR] {
+        self.0.to_le_bytes()
+    }
+
+This serializes the raw inner value WITHOUT reduction. Two field elements that
+are equal (both zero) can produce different byte representations:
+  - Mersenne31Field(0).to_le_bytes() == [0, 0, 0, 0]
+  - Mersenne31Field(0x7FFFFFFF).to_le_bytes() == [0xFF, 0xFF, 0xFF, 0x7F]
+
+IMPACT:
+This could be a problem if to_le_bytes() is used for:
+1. Hashing field elements into the Fiat-Shamir transcript (would break binding)
+2. Serializing proofs where canonical representation matters
+3. Equality comparisons via byte comparison
+
+However, the transcript uses to_reduced_u32() via flatten_leaf_into() and
+similar functions, which DO reduce. The primary serialization path through
+proof_flattener.rs also uses to_reduced_u32(). So the existing codebase
+appears safe.
+
+POC FEASIBILITY: Easy to demonstrate non-canonical serialization, but finding
+an exploitable path in the verifier would require to_le_bytes() to be used
+in a security-critical context, which does not appear to be the case currently.
+
+===============================================================================
+FINDING 3: as_boolean() DOES NOT FULLY REDUCE IN RELEASE MODE
+===============================================================================
+FILE: F:\Claude\BugBounty\targets\zksync\zksync-airbender\field\src\base.rs
+LINE: 530-542
+SEVERITY: Low-Medium (witness generation only)
+IN SCOPE: YES
+
+DESCRIPTION:
+The as_boolean() function:
+
+    fn as_boolean(&self) -> bool {
+        debug_assert!({
+            let as_uint = self.to_reduced_u32();
+            as_uint == 0 || as_uint == 1
+        }, "expected boolean value, got {}", self.to_reduced_u32());
+        // in non-debug we can just compare to 1
+        self.0 == 1
+    }
+
+In release builds, debug_assert is compiled away. If a field element has the
+non-canonical representation ORDER (= 0x7FFFFFFF, which represents zero), then:
+  - self.0 == 1 returns false
+  - The correct answer is also false (since ORDER represents zero, not one)
+
+So the function IS correct for the zero case. The only issue would be if
+somehow a value of 2 or higher (but still < ORDER) were passed -- the
+debug_assert would catch this in debug builds but not in release.
+
+IMPACT: This is primarily a witness generation concern. In the constraint
+system, boolean variables are enforced by constraints (b * (1 - b) == 0),
+so an invalid witness would be caught during proof generation. The risk is
+in witness evaluation code that calls as_boolean() on values that might not
+actually be boolean, potentially causing incorrect witness generation.
+
+POC FEASIBILITY: Low -- would need to find a code path where a non-boolean
+value reaches as_boolean() in release mode AND affects proof correctness.
+
+===============================================================================
+FINDING 4: double_impl() WITHOUT FINAL REDUCTION (non-use_division path)
+===============================================================================
+FILE: F:\Claude\BugBounty\targets\zksync\zksync-airbender\field\src\base.rs
+LINE: 366-377
+SEVERITY: Low (informational)
+IN SCOPE: YES
+
+DESCRIPTION:
+The double_impl() for the non-use_division path:
+
+    pub(crate) const fn double_impl(&'_ mut self) -> &'_ mut Self {
+        let mut sum = self.0 << 1;
+        let msb = sum & Self::MSBITMASK;
+        sum ^= msb;
+        sum += (msb != 0) as u32;
+        self.0 = sum;
+        self
+    }
+
+This performs the same reduction as add_mod: strips bit 31 and adds carry.
+Input range: [0, ORDER]. After shift: [0, 2*ORDER] = [0, 0xFFFFFFFE].
+After reduction: the result is in [0, ORDER], which is the accepted range.
+
+The commented-out line `//if sum >= Self::ORDER { sum -= Self::ORDER };`
+suggests this was intentionally left without final reduction, relying on the
+invariant that values in [0, ORDER] are acceptable.
+
+IMPACT: None -- this is consistent with the field's design where zero has
+two representations. All comparison operations use to_reduced_u32() which
+handles this correctly.
+
+===============================================================================
+FINDING 5: MaybeUninit USAGE IN FRI FOLDING (UNINITIALIZED MEMORY)
+===============================================================================
+FILE: F:\Claude\BugBounty\targets\zksync\zksync-airbender\verifier_common\src\fri_folding.rs
+LINE: 31-32, 59-60, 67-70
+SEVERITY: Low (code quality / potential UB)
+IN SCOPE: YES
+
+DESCRIPTION:
+The FRI folding functions create arrays via MaybeUninit::uninit().assume_init():
+
+    let mut leaf_parsed =
+        MaybeUninit::<[Mersenne31Quartic; MAX_SIZE_FOR_LEAF]>::uninit().assume_init();
+    let mut folding_evals_points_inversed =
+        MaybeUninit::<[Mersenne31Complex; MAX_SIZE_FOR_ROOTS]>::uninit().assume_init();
+    let mut buffer_0 =
+        MaybeUninit::<[Mersenne31Quartic; MAX_SIZE_FOR_LEAF]>::uninit().assume_init();
+    let mut buffer_1 =
+        MaybeUninit::<[Mersenne31Quartic; MAX_SIZE_FOR_LEAF]>::uninit().assume_init();
+
+MAX_SIZE_FOR_LEAF = 32, MAX_SIZE_FOR_ROOTS = 16.
+These are worst-case sizes, and only elements up to (1 << FOLDING_DEGREE_LOG2)
+are actually written. The remaining elements are never read.
+
+IMPACT: This is technically UB in Rust (creating uninitialized values of types
+that don't permit uninitialized bits). In practice, since Mersenne31Field is
+repr(transparent) over u32, and uninitialized elements are never read, this
+is unlikely to cause actual issues. The RISC-V target optimizer might
+theoretically exploit this UB.
+
+POC FEASIBILITY: Theoretical -- would require the compiler to optimize based
+on the UB assumption in a way that causes incorrect behavior.
+
+===============================================================================
+FINDING 6: REDUCED BLAKE2S ROUNDS (7 INSTEAD OF 10)
+===============================================================================
+FILE: F:\Claude\BugBounty\targets\zksync\zksync-airbender\transcript\src\lib.rs
+LINE: 7
+FILE: F:\Claude\BugBounty\targets\zksync\zksync-airbender\blake2s_u32\src\mixing_function.rs
+LINE: 112-121
+SEVERITY: Informational (design choice, not a bug)
+IN SCOPE: YES
+
+DESCRIPTION:
+The entire proof system uses "reduced rounds" Blake2s with 7 rounds instead
+of the standard 10:
+
+    const USE_REDUCED_BLAKE2_ROUNDS: bool = true;
+
+    pub fn round_function_reduced_rounds(...) {
+        for i in 0..7 {  // Standard Blake2s uses 10 rounds
+            ...
+        }
+    }
+
+This is used everywhere: transcript (Fiat-Shamir), Merkle trees, PoW, and
+leaf inclusion verification. The commented-out line shows it's an intentional
+optimization for performance inside the RISC-V ZK environment.
+
+IMPACT: 7-round Blake2s has reduced security margin compared to 10-round.
+While no practical attacks on 7-round Blake2s are known, the security margin
+is thinner. For use in Fiat-Shamir and Merkle commitments, the hash function
+needs to be collision-resistant and preimage-resistant. The reduced rounds
+may reduce the effective security of the proof system.
+
+This is a known design trade-off documented by the team. Academic attacks
+on reduced-round Blake2 exist for fewer than 7 rounds, but 7 rounds is
+generally considered safe for the security levels targeted (80-bit with PoW).
+
+POC FEASIBILITY: No known practical attack on 7-round Blake2s.
+
+===============================================================================
+FINDING 7: POTENTIAL FRI FOLDING FORMULA DISCREPANCY (NON-FMA vs FMA PATHS)
+===============================================================================
+FILE: F:\Claude\BugBounty\targets\zksync\zksync-airbender\verifier_common\src\fri_folding.rs
+LINE: 113-134 vs 260-267
+SEVERITY: Medium (potential soundness if paths diverge)
+IN SCOPE: YES
+
+DESCRIPTION:
+There are two FRI folding implementations: one using plain arithmetic and one
+using FMA (fused multiply-add). The formulas differ:
+
+NON-FMA path (fri_fold_by_log_n, line 127-134):
+    folded = a - b
+    folded *= root           (mul_assign_by_base)
+    folded *= challenge
+    folded += a
+    folded += b
+    Result: challenge * root * (a - b) + a + b
+
+FMA path (fri_fold_by_log_n_with_fma, line 261-266):
+    folded = -b + a          (negate b, add a -> a - b)
+    t = b + a                (a + b)
+    folded = folded * root + t   (FMA: (a-b)*root + (a+b))
+    But root already includes the challenge (line 209-210)!
+
+In the FMA path, the root is pre-multiplied by the challenge AND the shared
+factor. So the formula becomes:
+    (a - b) * challenge * root + (a + b)
+
+In the non-FMA path:
+    challenge * root * (a - b) + a + b
+
+These are algebraically equivalent when root is just the evaluation point
+inverse. HOWEVER, the key difference is:
+- NON-FMA: root is just the evaluation point inverse; challenge is applied
+  after the root multiplication
+- FMA: root is pre-multiplied by the challenge
+
+Both compute: (a + b) + challenge * root_inv * (a - b)
+
+After careful analysis, both paths compute the same mathematical result.
+The folding formula is: f_new(x^2) = (f(x) + f(-x))/2 + alpha/x * (f(x) - f(-x))/2
+which simplifies to: f(x) + alpha * (f(x) - f(-x)) / (2x) when evaluated at
+paired points. Both paths implement this correctly.
+
+IMPACT: After deeper analysis, this appears to be a correct optimization.
+No soundness issue detected. The FMA path pre-multiplies challenge into root
+for efficiency on the RISC-V target.
+
+POC FEASIBILITY: N/A -- no actual discrepancy found after thorough analysis.
+
+===============================================================================
+FINDING 8: QUERY INDEX UNIQUENESS NOT ENFORCED
+===============================================================================
+FILE: F:\Claude\BugBounty\targets\zksync\zksync-airbender\verifier\src\lib.rs
+LINE: 587-593
+SEVERITY: Low
+IN SCOPE: YES
+
+DESCRIPTION:
+The verifier draws query indices from the transcript and checks each query
+matches the expected index, but does not explicitly enforce that all query
+indices are unique:
+
+    for query_round in 0..NUM_QUERIES {
+        let query = &queries[query_round];
+        let query_index: u32 =
+            assemble_query_index(BITS_FOR_QUERY_INDEX, &mut bit_iterator) as u32;
+        assert_eq!(query.query_index, query_index);
+        ...
+    }
+
+Query indices are drawn deterministically from the transcript (Fiat-Shamir),
+so in an honest execution they would be pseudorandom. Duplicate indices
+would reduce the effective number of queries and thus soundness.
+
+IMPACT: With 53 queries over a domain of size 2^22 * 2 = 2^23, the birthday
+probability of a duplicate is approximately 53^2 / (2 * 2^23) ~= 0.00017,
+which is very small. Since indices are deterministic from the transcript, the
+prover cannot control them. The only scenario where this matters is if random
+indices happen to collide, which reduces soundness by a negligible amount.
+
+POC FEASIBILITY: Not exploitable -- indices are deterministic from Fiat-Shamir.
+
+===============================================================================
+FINDING 9: from_nonreduced_u32 DOUBLE SUBTRACTION MAY BE INSUFFICIENT
+===============================================================================
+FILE: F:\Claude\BugBounty\targets\zksync\zksync-airbender\field\src\base.rs
+LINE: 67-76
+SEVERITY: Low (informational)
+IN SCOPE: YES
+
+DESCRIPTION:
+The non-use_division path for from_nonreduced_u32:
+
+    pub const fn from_nonreduced_u32(c: u32) -> Self {
+        let mut c = c;
+        if c >= Self::ORDER { c -= Self::ORDER; }
+        if c >= Self::ORDER { c -= Self::ORDER; }
+        Self::new(c)
+    }
+
+This subtracts ORDER at most twice, handling inputs up to 3*ORDER - 1 =
+3 * 0x7FFFFFFF - 1 = 0x17FFFFFFD. Since the input is u32, the max is
+0xFFFFFFFF = ~4.29 billion, while 3*ORDER - 1 = ~6.44 billion. So any u32
+input is within 2*ORDER of the valid range:
+  max u32 = 0xFFFFFFFF
+  ORDER = 0x7FFFFFFF
+  0xFFFFFFFF / 0x7FFFFFFF = 2.0000000009...
+
+So after at most 2 subtractions, the result is in [0, ORDER]. This is correct
+for all u32 inputs.
+
+IMPACT: None -- the double subtraction is sufficient for all u32 inputs.
+
+POC FEASIBILITY: N/A -- no bug.
+
+===============================================================================
+FINDING 10: add_mod EDGE CASE ANALYSIS
+===============================================================================
+FILE: F:\Claude\BugBounty\targets\zksync\zksync-airbender\field\src\ops.rs
+LINE: 68-74
+SEVERITY: Informational (no bug found)
+IN SCOPE: YES
+
+DESCRIPTION:
+The add_mod function:
+
+    pub(crate) const fn add_mod(a: u32, b: u32) -> u32 {
+        let mut sum = a.wrapping_add(b);
+        let msb = sum & (1 << 31);
+        sum ^= msb;      // clear bit 31
+        sum += (msb != 0) as u32;  // add 1 if bit 31 was set
+        sum
+    }
+
+This works because for Mersenne31 (p = 2^31 - 1):
+  2^31 mod p = 1
+
+So if bit 31 is set, we subtract 2^31 and add 1, which is correct.
+
+Edge case analysis:
+- a = ORDER, b = ORDER: a + b = 0xFFFFFFFE
+  sum = 0xFFFFFFFE, msb = 0x80000000
+  sum = 0x7FFFFFFE ^ 0x80000000 + 1 = 0x7FFFFFFF = ORDER
+  This represents zero. Correct (0 + 0 = 0).
+
+- a = ORDER, b = 1: a + b = 0x80000000
+  sum = 0x80000000, msb = 0x80000000
+  sum = 0 + 1 = 1. Correct (0 + 1 = 1).
+
+- a = ORDER - 1, b = ORDER - 1: a + b = 0xFFFFFFFC
+  sum = 0xFFFFFFFC, msb = 0x80000000
+  sum = 0x7FFFFFFC + 1 = 0x7FFFFFFD = ORDER - 2. Correct.
+
+- a = ORDER, b = ORDER - 1: a + b = 0xFFFFFFFD
+  sum = 0xFFFFFFFD, msb = 0x80000000
+  sum = 0x7FFFFFFD + 1 = 0x7FFFFFFE = ORDER - 1. Correct (0 + (p-1) = p-1).
+
+All edge cases check out. The result range is [0, ORDER], consistent with
+the field's representation invariant.
+
+IMPACT: None -- add_mod is correct.
+
+===============================================================================
+FINDING 11: mul_mod OVERFLOW ANALYSIS
+===============================================================================
+FILE: F:\Claude\BugBounty\targets\zksync\zksync-airbender\field\src\ops.rs
+LINE: 90-95
+SEVERITY: Informational (no bug found)
+IN SCOPE: YES
+
+DESCRIPTION:
+    pub(crate) const fn mul_mod(a: u32, b: u32) -> u32 {
+        let product = (a as u64) * (b as u64);
+        let product_low = (product as u32) & ((1 << 31) - 1);
+        let product_high = (product >> 31) as u32;
+        add_mod(product_low, product_high)
+    }
+
+Max inputs: a = ORDER = 2^31 - 1, b = ORDER = 2^31 - 1
+product = (2^31 - 1)^2 = 2^62 - 2^32 + 1
+product_low = (2^62 - 2^32 + 1) & (2^31 - 1) = lower 31 bits
+product_high = (2^62 - 2^32 + 1) >> 31
+
+product_high max: 2^62 >> 31 = 2^31. So product_high fits in u32.
+product_low + product_high <= (2^31 - 1) + 2^31 = 2^32 - 1 (fits u32).
+This is then passed to add_mod which handles it correctly.
+
+IMPACT: None -- mul_mod is correct for all valid inputs.
+
+===============================================================================
+FINDING 12: MERKLE PATH DEPTH IS CALLER-PROVIDED, NOT INTRINSICALLY VALIDATED
+===============================================================================
+FILE: F:\Claude\BugBounty\targets\zksync\zksync-airbender\prover\src\definitions\leaf_inclusion_verifier\blake2s_for_everything.rs
+LINE: 26-28
+SEVERITY: Low-Medium
+IN SCOPE: YES
+
+DESCRIPTION:
+The verify_leaf_inclusion() trait method accepts depth as a parameter:
+
+    unsafe fn verify_leaf_inclusion<
+        I: NonDeterminismSource,
+        const CAP_SIZE: usize,
+        const NUM_COSETS: usize,
+    >(
+        &mut self,
+        coset_index: u32,
+        leaf_index: u32,
+        depth: usize,
+        leaf_encoding: &[u32],
+        merkle_cap: &[MerkleTreeCap<CAP_SIZE>; NUM_COSETS],
+    ) -> bool;
+
+The depth parameter determines how many sibling hashes are read from the
+non-determinism source (line 150: `for _ in 1..depth`). The function trusts
+the caller to provide the correct depth. In the verifier (skeleton_instance.rs),
+depth is set from compile-time constants (DEFAULT_MERKLE_PATH_LENGTH and
+computed fri_path_length), which are derived from trace length and cap size.
+
+If depth were wrong (too small), the Merkle proof would be for a smaller tree,
+potentially allowing a proof that doesn't correspond to the actual committed
+tree. However, since depth is a compile-time constant derived from the circuit
+parameters, and the verifier is generated for specific circuit dimensions,
+there's no runtime manipulation vector.
+
+For FRI intermediate oracles, the path length is correctly decremented:
+    fri_path_length -= FRI_FOLDING_SCHEDULE[fri_step];
+
+This is verified at compile time to be > 0 for all but the last step.
+
+IMPACT: No exploitable vector found. Depth is compile-time-determined and
+consistent with tree dimensions.
+
+POC FEASIBILITY: N/A -- depth values are compile-time constants.
+
+===============================================================================
+FINDING 13: NON-DETERMINISM SOURCE WITNESS DATA NOT AUTHENTICATED
+===============================================================================
+FILE: Multiple verifier files
+SEVERITY: Informational (design property, not a bug)
+IN SCOPE: YES
+
+DESCRIPTION:
+The verifier reads witness data (Merkle proofs, leaf values) from a
+NonDeterminismSource (CSR-based on RISC-V). This data is provided by the
+prover and authenticated through the proof verification process:
+1. Leaf values are Merkle-verified against committed roots
+2. Committed roots are bound to the Fiat-Shamir transcript
+3. Algebraic checks (quotient, FRI) verify consistency
+
+The design is sound: the verifier treats all prover-supplied data as untrusted
+and verifies it through cryptographic checks. This is the standard approach
+for STARK/FRI verifiers.
+
+IMPACT: None -- this is the expected design pattern.
+
+===============================================================================
+SUMMARY OF FINDINGS
+===============================================================================
+
+POTENTIALLY EXPLOITABLE (worth deeper investigation):
+1. Finding 1 (coeffs_in_base UB) - If any code path reaches this in the
+   verifier, it's immediately exploitable. Currently appears dormant.
+
+DESIGN OBSERVATIONS (not vulnerabilities):
+6. Finding 6 (Reduced Blake2s rounds) - Known optimization, 7 rounds considered
+   safe at target security level
+7. Finding 7 (FRI folding formula) - After analysis, both paths are equivalent
+8. Finding 8 (Query uniqueness) - Negligible impact due to Fiat-Shamir
+12. Finding 12 (Merkle depth) - Compile-time constants, no runtime attack vector
+
+NO BUG FOUND (code is correct):
+2. Finding 2 (to_le_bytes) - Not used in security-critical paths
+3. Finding 3 (as_boolean) - Correct for the zero case; constraints catch others
+4. Finding 4 (double_impl) - Consistent with field invariants
+5. Finding 5 (MaybeUninit) - Technically UB but practically safe
+9. Finding 9 (from_nonreduced_u32) - Correct for all u32 inputs
+10. Finding 10 (add_mod) - Correct
+11. Finding 11 (mul_mod) - Correct
+
+NEXT STEPS:
+- Investigate whether Finding 1 (coeffs_in_base) can be triggered through any
+  code path in the verifier or constraint system
+- Investigate the constraint system gates more deeply for under-constraint
+  issues (requires reading the generated quotient evaluation code)
+- Look at the shuffle RAM argument and lazy init boundary value checks for
+  potential bypass vectors in full_statement_verifier
+- Check if the intentionally-planted Medium bug might relate to EVM behavior
+  deviation (outside the scope of this STARK/FRI-focused analysis)

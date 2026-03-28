@@ -1,0 +1,592 @@
+==============================================================================
+ZKSYNC OS / AIRBENDER CONSTRAINT SYSTEM AUDIT
+Gate Under-Constraint Analysis
+Date: 2026-03-28
+Repo: zksync-airbender (STARK proof system for RISC-V execution)
+==============================================================================
+
+EXECUTIVE SUMMARY
+=================
+This audit examined the Airbender constraint system for under-constrained
+circuits that could allow proof forgery. The system implements a RISC-V
+RV32IM machine as an AIR (Algebraic Intermediate Representation) with
+degree-2 constraints, lookup arguments, and a shuffle-RAM memory argument.
+
+The constraint system uses a sophisticated architecture:
+- Degree-2 polynomial constraints (quadratic max)
+- Lookup tables for bitwise ops, shifts, conditional resolution
+- Shuffle-RAM grand product argument for memory consistency
+- Delegation argument for sub-circuit computation offloading
+- Optimization context that merges multiple opcode branches into shared
+  constraint slots via orthogonal selection flags
+
+KEY GATE TYPES IDENTIFIED:
+1. Boolean constraints: x*(x-1) = 0
+2. Range check constraints: via lookup tables (8-bit and 16-bit)
+3. Add/Sub arithmetic: 32-bit addition with carry propagation
+4. Mul/Div arithmetic: schoolbook multiplication with sign extension
+5. Lookup argument: width-3 table lookups for bitwise, shift, decode
+6. Shuffle-RAM memory argument: grand product for read/write consistency
+7. Delegation argument: for offloading Blake2/BigInt to sub-circuits
+8. Decoder constraints: instruction field extraction and opcode classification
+
+==============================================================================
+FINDINGS
+==============================================================================
+
+FINDING 1: MOP (Modular Arithmetic) Result Not Range-Checked Before Canonicality Test
+------
+
+GATE: MopOp (ADDMOD/SUBMOD/MULMOD)
+FILE: F:\Claude\BugBounty\targets\zksync\zksync-airbender\cs\src\machine\ops\mop.rs
+CONSTRAINT: result_tmp_low + result_tmp_high * 2^16 = op(src1, src2)
+            exec_flag * (result_tmp_low - result_register.0[0]) = 0
+            exec_flag * (result_tmp_high - result_register.0[1]) = 0
+            (1 - uf_flag) * exec_flag = 0 (canonicality: result < p)
+ISSUE: The intermediate variables result_tmp_low and result_tmp_high are
+       NOT range-checked to 16 bits. They are allocated via cs.add_variable()
+       (line 92), not cs.add_variable_with_range_check(). The constraint
+       only enforces that exec_flag * (tmp - output) = 0, meaning if
+       exec_flag=1, then tmp must equal the range-checked output register.
+       However, the canonicality check via sub_relation only checks that
+       result_register < p (the field modulus). The issue is that
+       result_register IS range-checked (via get_register_output), so the
+       constraint exec_flag*(tmp-reg)=0 forces tmp=reg when executing.
+
+       ANALYSIS: On closer inspection, when exec_flag=1, result_tmp must
+       equal result_register which IS range-checked. The MulDivRelation or
+       product constraint uses result_tmp directly, but since it equals the
+       range-checked register, this is actually sound. The canonicality
+       check (result < CHARACTERISTICS) is enforced via the underflow flag.
+
+       STATUS: NOT EXPLOITABLE - the indirection through exec_flag
+       multiplication correctly links the unchecked tmp vars to checked
+       register vars.
+EXPLOIT: N/A
+SEVERITY: Informational (code quality - should use explicit range checks
+          on tmp vars for defense in depth)
+
+
+FINDING 2: Conditional Lookup Outputs Not Boolean-Constrained
+------
+
+GATE: LoadOp / StoreOp / ShiftOp (conditional lookups)
+FILE: F:\Claude\BugBounty\targets\zksync\zksync-airbender\cs\src\machine\ops\load.rs (lines 167-172)
+      F:\Claude\BugBounty\targets\zksync\zksync-airbender\cs\src\machine\ops\store.rs (lines 143-148)
+CONSTRAINT: Various lookup outputs used as selection bits (bit_0, bit_1,
+            is_ram_range, etc.)
+ISSUE: The code explicitly notes "we do NOT cast presumable bits to
+       booleans, as it's under conditional assignment of lookup" (load.rs
+       line 189). Variables like bit_0, bit_1 from MemoryOffsetGetBits
+       lookup and is_ram_range from RomAddressSpaceSeparator lookup are
+       used as selection flags in multiplications but are NOT constrained
+       to be boolean (0 or 1) outside the lookup table.
+
+       ANALYSIS: These variables come from lookup table outputs. The lookup
+       argument itself constrains the full tuple (input, output1, output2)
+       to be a valid table row. Since the table is fixed and only contains
+       0 or 1 in the relevant output columns, the lookup argument implicitly
+       constrains these to be boolean. The optimization context's
+       enforce_all() function (line 1042) calls
+       enforce_lookup_tuple_for_variable_table which enforces the full
+       lookup argument including these outputs.
+
+       However, these lookups are CONDITIONAL (predicated by exec_flag).
+       The orthogonal selection in enforce_all() merges variants, and when
+       the opcode is not executed, the merged value defaults to 0 (all-zeros
+       row of the ZeroEntry table). So the constraint is still sound.
+
+       STATUS: NOT EXPLOITABLE - lookup argument provides implicit boolean
+       constraint on table outputs.
+EXPLOIT: N/A
+SEVERITY: Informational
+
+
+FINDING 3: Carry Variables in Add/Sub Are Boolean-Constrained But
+           Intermediate Carry Has Deferred Constraint
+------
+
+GATE: AddSubRelation (enforce_add_sub_relation)
+FILE: F:\Claude\BugBounty\targets\zksync\zksync-airbender\cs\src\devices\utils.rs (lines 42-79)
+      F:\Claude\BugBounty\targets\zksync\zksync-airbender\cs\src\devices\optimization_context.rs (lines 840-868)
+CONSTRAINT: a_low + b_low - c_low - carry_intermediate * 2^16 = 0
+            a_high + b_high - c_high + carry_intermediate - carry_out * 2^16 = 0
+ISSUE: carry_intermediate and carry_out are allocated as Boolean variables
+       (Boolean::new(cs) calls add_boolean_variable which enforces x*(x-1)=0).
+       All operands a, b, c are range-checked to 16-bit limbs.
+
+       ANALYSIS: With a_low, b_low, c_low in [0, 2^16-1] and
+       carry_intermediate in {0,1}:
+       - a_low + b_low ranges from 0 to 2*(2^16-1) = 131070
+       - c_low ranges from 0 to 2^16-1 = 65535
+       - So a_low + b_low - c_low ranges from -(2^16-1) to 2*(2^16-1)
+       - For this to equal carry_intermediate * 2^16, carry_intermediate
+         must be 0 or 1 (enforced by boolean constraint)
+       - When carry_intermediate=0: a_low + b_low = c_low (valid add low)
+       - When carry_intermediate=1: a_low + b_low = c_low + 2^16 (carry)
+
+       The same analysis holds for the high limb constraint.
+
+       STATUS: SOUND - boolean constraints on carries plus range checks on
+       limbs fully constrain the 32-bit addition.
+EXPLOIT: N/A
+SEVERITY: N/A (Sound)
+
+
+FINDING 4: Decoder imm11 and rs2_low Constrained Only via x*(x-1)=0
+------
+
+GATE: OptimizedDecoder
+FILE: F:\Claude\BugBounty\targets\zksync\zksync-airbender\cs\src\machine\decoder\decode_optimized_must_handle_csr.rs (lines 162-184)
+CONSTRAINT: imm11_constraint * (imm11_constraint - 1) = 0
+            rs2_low_constraint * (rs2_low_constraint - 1) = 0
+            where imm11_constraint and rs2_low_constraint are LINEAR
+            expressions derived from instruction decomposition
+ISSUE: imm11 and rs2_low are not allocated as explicit variables. Instead,
+       they are defined implicitly as linear constraints from the instruction
+       decomposition:
+       imm11 = (insn_low - opcode - 2^8*imm4_1 - 2^12*funct3 - 2^15*rs1_low) / 2^7
+       rs2_low = (insn_high - rs1_high - 2^5*rs2_high - 2^9*imm10_5 - 2^15*sign_bit) / 2^4
+
+       The x*(x-1)=0 constraint ensures these expressions evaluate to 0 or 1.
+       Combined with the range checks on all other decomposition pieces
+       (opcode: 7-bit via table, imm4_1: 4-bit, funct3: 3-bit, rs1_low: bool,
+       rs1_high: 4-bit, rs2_high: 4-bit, imm10_5: 6-bit, sign_bit: bool,
+       insn_low/insn_high: 16-bit range-checked register),
+       this fully constrains the instruction decomposition.
+
+       ANALYSIS: Since insn_low is 16 bits and all other pieces are range-
+       checked to their proper widths, the residual (imm11) must be exactly
+       0 or 1 for the decomposition to be consistent. The x*(x-1)=0
+       constraint prevents any other value. This is a clever optimization
+       that avoids allocating explicit variables.
+
+       STATUS: SOUND
+EXPLOIT: N/A
+SEVERITY: N/A (Sound)
+
+
+FINDING 5: Division-by-Zero Quotient Constraint May Be Insufficient
+           for Non-Standard Division Cases
+------
+
+GATE: DivRemOp (unsigned and signed)
+FILE: F:\Claude\BugBounty\targets\zksync\zksync-airbender\cs\src\machine\ops\mul_div.rs
+CONSTRAINT: (unsigned case, lines 346-357):
+            MulDivRelation: divisor * quotient + remainder = dividend (mod 2^32)
+            with mul_high = 0
+            Plus: remainder < divisor (when divisor != 0)
+            Plus: quotient = 0xFFFFFFFF when divisor = 0
+ISSUE: The division is constrained via a MULTIPLICATION relation:
+       divisor * quotient + remainder = dividend
+       with the product high word constrained to zero.
+
+       For div-by-zero: The constraint divisor * quotient + remainder =
+       dividend becomes 0 * quotient + remainder = dividend, so remainder =
+       dividend (correct per RISC-V spec). Quotient is explicitly
+       constrained to 0xFFFF_FFFF via:
+       should_enforce * (quotient_low - 0xffff) = 0
+       should_enforce * (quotient_high - 0xffff) = 0
+       where should_enforce = divisor_is_zero AND exec_flag.
+
+       For signed div overflow (INT_MIN / -1): The constraint handles this
+       via special witness computation but the circuit constraint is through
+       the MulDivRelation with sign bits. The z3 verification script
+       referenced in comments (line 580) validates the sign computation.
+
+       ANALYSIS: The MulDivRelation enforces that the SIGNED multiplication
+       of (divisor with sign) * (quotient with sign) + (remainder with sign)
+       equals (dividend with sign extension). The sign extension to 64 bits
+       and schoolbook multiplication in the optimization context's
+       enforce_all() handles the signed arithmetic correctly.
+
+       The remainder < divisor check (line 368-373) is:
+       (1 - divisor_is_zero) * (1 - borrow_flag) * exec_flag = 0
+       This means: if executing AND divisor != 0, then borrow_flag must be 1,
+       meaning remainder - divisor underflows, i.e., remainder < divisor.
+
+       STATUS: SOUND for standard cases. The signed overflow case
+       (INT_MIN / -1) is handled correctly because the MulDivRelation
+       constraint with the special sign computation produces the right
+       answer (quotient = INT_MIN, remainder = 0).
+EXPLOIT: N/A
+SEVERITY: N/A (Sound)
+
+
+FINDING 6: Orthogonal Flag Assumption in choose_from_orthogonal_variants
+------
+
+GATE: CommonDiffs::select_final_rd_value, select_final_pc_value
+FILE: F:\Claude\BugBounty\targets\zksync\zksync-airbender\cs\src\devices\diffs.rs
+      F:\Claude\BugBounty\targets\zksync\zksync-airbender\cs\src\cs\circuit.rs (lines 549-557)
+CONSTRAINT: result = sum(flag_i * variant_i) for all i
+            where flags are assumed orthogonal (at most one is 1)
+ISSUE: The choose_from_orthogonal_variants function computes result as
+       a linear combination of flags * variants. It ASSUMES the flags are
+       orthogonal (at most one flag is true). This is critical because if
+       two flags could be simultaneously 1, the result would be the sum
+       of two variants rather than a selection.
+
+       ANALYSIS: The flags come from the decoder's opcode_lookup which
+       returns bits from the OpTypeBitmask table. This table is pre-computed
+       and contains exactly one format bit set per valid opcode encoding.
+       The lookup argument constrains the actual bitmask to match a table
+       entry, so the format bits [R,I,S,B,U,J] are guaranteed orthogonal
+       by the table content. The major instruction family flags are derived
+       from these format bits and additional variant bits from the same
+       table lookup.
+
+       The key question is: can an attacker provide a witness where
+       multiple major flags are 1? This would require a table entry where
+       multiple bits are set, but the table is part of the SETUP (fixed
+       by the prover's trusted setup) and verified via Merkle commitment.
+       So the table content cannot be manipulated.
+
+       STATUS: SOUND - orthogonality is enforced by lookup into a fixed
+       table with mutually exclusive bit patterns.
+EXPLOIT: N/A
+SEVERITY: N/A (Sound)
+
+
+FINDING 7: Register x0 Write Handling
+------
+
+GATE: writeback_no_exception_with_opcodes_in_rom
+FILE: F:\Claude\BugBounty\targets\zksync\zksync-airbender\cs\src\machine\machine_configurations\state_transition_parts\writeback_no_exceptions.rs (lines 46-96)
+CONSTRAINT: reg_write_value_low = (1 - reg_is_zero) * new_reg_val.0[0]
+            reg_write_value_high = (1 - reg_is_zero) * new_reg_val.0[1]
+            Plus address constraints for rd_or_mem_store_query
+ISSUE: RISC-V x0 register must always read as 0 and writes to it must
+       be discarded. The circuit handles this by:
+       1. Computing rd index from decoder
+       2. Checking if rd == 0 (reg_is_zero flag)
+       3. Masking the write value to 0 when writing to x0
+       4. The memory query still writes 0 to address 0 (register x0)
+
+       For BRANCH instructions (B-format), the write address and value are
+       both constrained to 0 (lines 76-96), modeling a no-op write to x0.
+
+       ANALYSIS: The constraint on lines 52-59 ensures that if rd=0, the
+       written value is 0. The shuffle-RAM memory argument will then see
+       a write of 0 to register 0, which is consistent with x0 always
+       being 0. However, this requires that the INITIAL state of x0 is 0,
+       which is handled by the boundary constraints (public inputs).
+
+       STATUS: SOUND
+EXPLOIT: N/A
+SEVERITY: N/A (Sound)
+
+
+FINDING 8: ASSUME_TRUSTED_CODE Flag Disables Exception Handling
+------
+
+GATE: Multiple opcodes (Jump, Conditional, Load, Store)
+FILE: Multiple files in cs/src/machine/ops/
+CONSTRAINT: Various alignment and trap checks are SKIPPED when
+            ASSUME_TRUSTED_CODE = true
+ISSUE: When ASSUME_TRUSTED_CODE is true (which is the production
+       configuration for ZKsync OS), the circuit makes misaligned memory
+       accesses and misaligned jump targets cause the circuit to be
+       UNSATISFIABLE rather than trapping. This means:
+
+       - Misaligned jumps: enforced via cs.add_constraint(misaligned * exec_flag)
+         which means if executing a jump AND the address is misaligned,
+         the constraint is violated and no valid proof can be created.
+       - Misaligned loads/stores: similar enforcement
+       - ROM write attempts: constrained to be impossible
+
+       The alternative code paths (ASSUME_TRUSTED_CODE = false) would
+       implement proper exception handling with trap codes, but they are
+       marked as todo!().
+
+       ANALYSIS: This design choice means that if the bytecode contains
+       any instruction that would cause a misaligned access, the entire
+       circuit becomes unprovable. This is acceptable for ZKsync OS where
+       the bytecode is assumed to be compiled correctly (the "trusted code"
+       assumption). It does NOT allow an attacker to bypass alignment
+       checks - it makes the proof impossible to generate, which is safe
+       from a verification perspective.
+
+       STATUS: DESIGN CHOICE - safe for trusted code, but the
+       ASSUME_TRUSTED_CODE=false paths are incomplete (todo!()).
+EXPLOIT: N/A
+SEVERITY: Informational (incomplete exception handling for untrusted code)
+
+
+FINDING 9: Potential Issue in Signed Multiplication Sign Extension
+------
+
+GATE: MulDivRelation enforcement (schoolbook multiplication)
+FILE: F:\Claude\BugBounty\targets\zksync\zksync-airbender\cs\src\devices\optimization_context.rs (lines 1114-1200)
+CONSTRAINT: Schoolbook byte-level multiplication with sign extension:
+            op1_t[i] for i >= 4 = op1_sign * 0xFF (sign extension bytes)
+            op2_t[i] for i >= 4 = op2_sign * 0xFF
+ISSUE: The sign extension for multiplication creates an 8-byte (64-bit)
+       representation from a 4-byte (32-bit) value by filling the upper
+       4 bytes with sign_bit * 0xFF. The op1_decomposition and
+       op2_decomposition are obtained from RegisterDecomposition::parse_reg
+       which decomposes the 16-bit limbs into 8-bit bytes.
+
+       ANALYSIS: The decomposition is enforced by:
+       - Register limbs are range-checked to 16 bits
+       - parse_reg creates 8-bit decompositions with range checks
+       - The multiplication constraint uses the byte decomposition
+
+       The sign extension byte is sign_bit * 0xFF where sign_bit is
+       constrained to be 0 or 1 (via Boolean). When sign=0, extension
+       bytes are 0x00. When sign=1, extension bytes are 0xFF. This
+       correctly implements two's complement sign extension.
+
+       The schoolbook multiplication then computes:
+       result[k] = sum(op1[i] * op2[j] for i+j=k) for each byte position
+       with carry propagation between positions.
+
+       STATUS: SOUND - sign extension logic is correct for two's complement.
+EXPLOIT: N/A
+SEVERITY: N/A (Sound)
+
+
+FINDING 10: BinaryOp (AND/OR/XOR) Uses funct3 as Table Selector
+------
+
+GATE: BinaryOp
+FILE: F:\Claude\BugBounty\targets\zksync\zksync-airbender\cs\src\machine\ops\binops.rs (lines 183-191)
+CONSTRAINT: [out] = lookup(left_byte, right_byte, table_id=funct3)
+            where table IDs are: AND=7, XOR=4, OR=6 matching funct3 values
+ISSUE: The binary operations use funct3 (from instruction decoding) as
+       the table selector for the lookup. The table IDs for AND (7), XOR
+       (4), and OR (6) are deliberately set to match the RISC-V funct3
+       encoding for these operations.
+
+       ANALYSIS: The funct3 value comes from instruction decoding and is
+       range-checked to 3 bits (0-7) via the decode table. The opcode
+       lookup table (OpTypeBitmask) only classifies the specific
+       (opcode, funct3, funct7) combinations as BINOP family. So when
+       BINOP executes, funct3 is guaranteed to be one of {4, 6, 7}.
+
+       However, the lookup is performed via
+       append_lookup_relation_from_linear_terms with funct3 as the table
+       parameter. In the optimization context's enforce_all(), this gets
+       merged via orthogonal selection. If another opcode family also uses
+       the same lookup slot but with a different funct3, the merged table
+       ID would be the selected one.
+
+       Since different opcode families use different lookup slots
+       (different indexer values), there is no cross-contamination.
+
+       STATUS: SOUND - table ID correctly matches funct3 encoding.
+EXPLOIT: N/A
+SEVERITY: N/A (Sound)
+
+
+FINDING 11: Shift Operations Lookup-Based Implementation
+------
+
+GATE: ShiftOp (SLL, SRL, SRA, SLLI, SRLI, SRAI)
+FILE: F:\Claude\BugBounty\targets\zksync\zksync-airbender\cs\src\machine\ops\shift.rs
+CONSTRAINT: Shift amount truncated to 5 bits via ExtractLower5Bits table.
+            Shift result computed via ShiftImplementation table lookups.
+            SRA sign fill via SRASignFiller table.
+ISSUE: The shift implementation relies entirely on lookup tables for
+       correctness. The shift amount is first extracted via:
+       [shift_amount, _] = lookup(src2.low, ExtractLower5Bits)
+
+       Then the actual shift is performed via:
+       [in_place, shifted] = lookup(input.low + 2^16*shift + 2^21*is_right,
+                                     ShiftImplementation)
+
+       For SRA, additional sign fill bits are looked up:
+       [sra_low, sra_high] = lookup(sign + 2*is_sra + 4*shift, SRASignFiller)
+
+       ANALYSIS: The correctness depends entirely on the table contents.
+       Since tables are part of the setup and committed via Merkle trees,
+       they cannot be manipulated. The lookup argument ensures that any
+       witness values must correspond to actual table entries.
+
+       The result assembly (lines 216-224) for non-cyclic shifts:
+       - SRL: selected_low = low_in_place + shifted_from_high
+              selected_high = high_in_place
+       - SLL: selected_low = low_in_place
+              selected_high = high_in_place + shifted_from_low
+
+       This is implemented via:
+       selected_low = is_right * (low_in_place + shifted_from_high)
+                    + (1 - is_right) * low_in_place
+       selected_high = is_right * high_in_place
+                     + (1 - is_right) * (high_in_place + shifted_from_low)
+
+       STATUS: SOUND - lookup tables enforce correct shift results.
+EXPLOIT: N/A
+SEVERITY: N/A (Sound)
+
+
+FINDING 12: Rotation Support Incomplete (todo!())
+------
+
+GATE: ShiftOp with SUPPORT_ROT=true
+FILE: F:\Claude\BugBounty\targets\zksync\zksync-airbender\cs\src\machine\ops\shift.rs (line 258)
+CONSTRAINT: N/A - todo!()
+ISSUE: Rotation operations (ROL, ROR, RORI) are decoded in the decoder
+       subspace (lines 54-97) but the actual constraint implementation
+       is todo!() (line 258). If SUPPORT_ROT=true is used in production,
+       the circuit would panic during constraint generation.
+
+       ANALYSIS: This appears to be for the Zbb extension which may not
+       be used in the production configuration. The production machine
+       configuration would need to be checked to confirm SUPPORT_ROT is
+       false.
+
+       STATUS: INCOMPLETE IMPLEMENTATION - not a vulnerability if the
+       production config doesn't enable rotations.
+EXPLOIT: N/A
+SEVERITY: Low (incomplete feature)
+
+
+FINDING 13: Memory Argument Grand Product Accumulator Boundary Check
+------
+
+GATE: Shuffle-RAM memory argument
+FILE: F:\Claude\BugBounty\targets\zksync\zksync-airbender\cs\src\definitions\ram_access.rs
+      F:\Claude\BugBounty\targets\zksync\zksync-airbender\verifier_common\src\lib.rs
+CONSTRAINT: Grand product argument: prod(read_tuple + gamma) / prod(write_tuple + gamma) = 1
+            (accumulated across all rows)
+ISSUE: The shuffle-RAM uses a grand product argument to ensure memory
+       consistency. Each memory access contributes a factor to the
+       accumulator. The verifier checks that the final accumulator value
+       equals the expected boundary value.
+
+       The memory model uses timestamps to order accesses:
+       - Each cycle gets a unique timestamp derived from circuit_idx and row
+       - Read timestamp must be less than write timestamp
+       - Timestamp comparison is enforced via auxiliary variables and
+         borrow chains (ShuffleRamAuxComparisonSet)
+
+       ANALYSIS: The grand product argument is a standard cryptographic
+       construction. Its soundness relies on:
+       1. The random challenge gamma being sampled AFTER all witness
+          polynomials are committed (Fiat-Shamir)
+       2. The product check being computed correctly over the extension field
+          (Mersenne31Quartic)
+       3. Boundary values being correctly propagated across circuit segments
+
+       The verifier checks the accumulated product value against the
+       boundary values from the proof output. Cross-circuit memory
+       consistency is handled by the full_statement_verifier which
+       aggregates boundary values across all circuit segments.
+
+       STATUS: SOUND - standard grand product argument construction.
+EXPLOIT: N/A
+SEVERITY: N/A (Sound)
+
+
+FINDING 14: Verifier Uses Generated Code That Must Match Prover Constraints
+------
+
+GATE: All constraints
+FILE: F:\Claude\BugBounty\targets\zksync\zksync-airbender\verifier\src\generated\quotient.rs
+      F:\Claude\BugBounty\targets\zksync\zksync-airbender\circuit_defs\*\generated\quotient.rs
+CONSTRAINT: Generated quotient polynomial evaluation code
+ISSUE: The verifier's constraint checking is done via auto-generated Rust
+       code in quotient.rs files. These are generated by the
+       witness_eval_generator and verifier_generator tools. The critical
+       question is whether the generated verifier code matches the prover's
+       constraint definitions.
+
+       ANALYSIS: The quotient.rs file for the main verifier is 9577 lines
+       of generated code. It evaluates:
+       1. Boolean constraints (x*(x-1)=0) for all boolean variables
+       2. All degree-2 polynomial constraints
+       3. Lookup argument contributions
+       4. Memory argument contributions
+       5. Delegation argument contributions
+       6. Boundary constraints (first/last row)
+
+       The generation pipeline is:
+       circuit_defs/*/src/lib.rs -> one_row_compiler -> generated code
+
+       Each circuit type (main machine, bigint, blake2) has its own
+       generated quotient. The verifier for each circuit type includes the
+       corresponding generated quotient.
+
+       The risk here is a mismatch between what the prover constrains and
+       what the verifier checks. However, since both are generated from
+       the same source (the CircuitOutput), this risk is mitigated by the
+       code generation pipeline.
+
+       STATUS: SOUND assuming code generation pipeline is correct.
+       A manual diff of prover vs verifier constraints would require
+       comparing the full 9577-line generated file against the constraint
+       definitions, which is beyond practical manual audit scope.
+EXPLOIT: N/A
+SEVERITY: Informational (trusting code generation pipeline)
+
+
+FINDING 15: Double set_values Call in append_mul_relation_raw
+------
+
+GATE: MulDivRelation (raw)
+FILE: F:\Claude\BugBounty\targets\zksync\zksync-airbender\cs\src\devices\optimization_context.rs (lines 466-468)
+CONSTRAINT: N/A (witness generation, not constraint)
+ISSUE: The function append_mul_relation_raw() calls cs.set_values(value_fn)
+       TWICE on lines 466 and 468:
+
+       cs.set_values(value_fn);
+       cs.set_values(value_fn);
+
+       This is clearly a copy-paste bug. The set_values function registers
+       a witness evaluation closure. Calling it twice means the witness
+       evaluation function is registered twice, which wastes computation
+       during witness generation but does not affect constraint soundness.
+
+       ANALYSIS: This is a witness-generation-only issue. The constraints
+       themselves (the MulDivRelation added on line 470-482) are only added
+       once. The double witness registration may cause the witness to be
+       computed twice but will produce the same result both times (the
+       function is deterministic given the same inputs).
+
+       STATUS: BUG but NOT SECURITY-RELEVANT - only affects prover
+       performance, not verification soundness.
+EXPLOIT: N/A
+SEVERITY: Low (code quality / performance bug)
+
+
+==============================================================================
+SUMMARY OF CRITICAL/HIGH FINDINGS
+==============================================================================
+
+No Critical or High severity under-constraint vulnerabilities were found.
+
+The constraint system appears well-designed with the following defense layers:
+1. Range checks on all register limbs (16-bit) via lookup tables
+2. Boolean constraints on all flag variables
+3. Lookup argument for table-based operations
+4. Grand product argument for memory consistency
+5. Orthogonal selection flags preventing multi-branch activation
+6. Carry chain propagation in arithmetic with boolean carry bits
+7. Sign extension via boolean-constrained sign bits
+
+The main areas that would warrant further investigation:
+- The 9577-line generated verifier quotient code vs prover constraints
+- The full_statement_verifier cross-circuit boundary value aggregation
+- The delegation argument for sub-circuit correctness
+- Tables content verification (are all lookup tables correctly populated?)
+
+==============================================================================
+METHODOLOGY
+==============================================================================
+
+Files examined:
+- cs/src/constraint.rs - Polynomial constraint algebra
+- cs/src/definitions/ - All definition files (constraints, lookup, RAM, etc.)
+- cs/src/cs/circuit.rs - Circuit trait and core operations
+- cs/src/devices/optimization_context.rs - Relation enforcement
+- cs/src/devices/utils.rs - Add/sub enforcement
+- cs/src/devices/diffs.rs - State transition merging
+- cs/src/machine/ops/*.rs - All opcode implementations
+- cs/src/machine/decoder/*.rs - Instruction decoding
+- cs/src/machine/machine_configurations/ - State transition
+- cs/src/one_row_compiler/ - Constraint compilation
+- cs/src/tables.rs - Lookup table definitions
+- verifier/src/generated/quotient.rs - Generated verifier constraints
+- verifier_common/src/lib.rs - Verifier common infrastructure
+- circuit_defs/ - Circuit definitions for all circuit types

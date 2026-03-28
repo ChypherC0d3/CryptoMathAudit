@@ -1,0 +1,366 @@
+================================================================================
+ZKSYNC ERA - P256Verify, FFLONK Verifier & Crypto Precompile Deep Dive
+================================================================================
+Date: 2026-03-28
+Target: ZKsync Era (era-contracts repository)
+Bounty: https://immunefi.com/bug-bounty/zksyncera/scope/
+Max Payout: $1,100,000 (Critical)
+
+================================================================================
+SCOPE VERIFICATION
+================================================================================
+
+Confirmed IN SCOPE (from Immunefi listing):
+- P256Verify precompile (0x0100) - L2 system contract - YES IN SCOPE
+- L1VerifierFflonk.sol - L1 smart contract verifier - YES IN SCOPE
+- DualVerifier.sol - L1 smart contract - YES IN SCOPE
+- EcAdd (0x0006), EcMul (0x0007), EcPairing (0x0008) - L2 precompiles - YES IN SCOPE
+- Ecrecover (0x0001), SHA256 (0x0002) - L2 precompiles - YES IN SCOPE
+- Modexp precompile - L2 system contract - YES IN SCOPE
+
+Repository: https://github.com/matter-labs/era-contracts
+Rewards: 10% of funds directly affected, capped at $100,000 for critical.
+
+================================================================================
+STEP 1 - P256Verify PRECOMPILE AUDIT
+================================================================================
+
+File: system-contracts/contracts/precompiles/P256Verify.yul (93 lines)
+
+ARCHITECTURE:
+- This is a THIN WRAPPER around the zkEVM built-in secp256r1 circuit.
+- It does NOT implement P256 signature verification in Yul/Solidity.
+- Input: 160 bytes (digest, r, s, x, y) - 5 x 32-byte words.
+- All validation (point on curve, r/s range checks, signature math) is
+  delegated to the internal circuit via `precompileCall`.
+- The Yul contract only checks calldata length == 160 and handles the
+  success/failure return.
+
+ANALYSIS:
+
+a) Custom vs Library:
+   - NOT a custom implementation. Delegates to the zkEVM circuit precompile.
+   - The actual cryptographic operations happen in the hardware/circuit layer.
+   - This significantly reduces the attack surface of the Yul wrapper.
+
+b) Point validation: Delegated to the circuit. NOT checked in the Yul code.
+c) Signature validation (r, s range): Delegated to the circuit.
+d) Edge cases (r=0, s=0, r=n, s=n): Delegated to the circuit.
+   Tests confirm these are rejected (see P256Verify.spec.ts lines 90-112).
+e) Non-canonical encodings: Calldata is 32-byte words, no encoding issues.
+f) Return value handling:
+   - Checks both `success` (outer precompile call result) AND `internalSuccess`
+     (circuit's own success flag at memory[0]).
+   - Additionally checks `isValid` at memory[32] is non-zero.
+   - Returns memory[32..64] on success (the 1 value), or empty bytes on failure.
+   - This matches RIP-7212 spec: return 1 on valid, empty on invalid.
+
+POTENTIAL ISSUES:
+
+FINDING: P256Verify permits signature malleability (s vs n-s)
+FILE: system-contracts/contracts/precompiles/P256Verify.yul
+LINE: N/A (circuit behavior) / test at P256Verify.spec.ts line 148
+SEVERITY: Low (Informational)
+IN SCOPE: YES
+DESCRIPTION: The P256Verify precompile accepts both (r, s) and (r, n-s) as
+valid signatures for the same message and public key. The test at line 148
+explicitly confirms "Malleability is permitted" - this is by design per
+RIP-7212 which follows the secp256r1 standard (unlike secp256k1/ecrecover
+which enforces low-s). However, applications relying on P256Verify for
+uniqueness of signatures (e.g., replay protection) could be vulnerable if
+they don't enforce low-s themselves.
+IMPACT: Applications using P256Verify without additional malleability checks
+could be vulnerable to signature replay if they use the signature itself as a
+unique identifier. This is documented behavior but worth noting.
+
+FINDING: P256Verify gas cost diverges from RIP-7212 specification
+FILE: system-contracts/contracts/precompiles/P256Verify.yul
+LINE: 20-22
+SEVERITY: Low (Informational)
+IN SCOPE: YES
+DESCRIPTION: The gas cost is 12000 instead of the RIP-7212 specified 3450.
+This is acknowledged in the zkSync docs ("Since zkSync Era has a different
+gas schedule, it does not comply with the expected 3450 gas cost"). While not
+a vulnerability, contracts ported from Ethereum that hardcode gas limits for
+P256Verify calls may fail on ZKsync Era.
+IMPACT: Cross-chain compatibility issues for contracts expecting RIP-7212
+standard gas costs.
+
+================================================================================
+STEP 2 - FFLONK VERIFIER AUDIT
+================================================================================
+
+File: l1-contracts/contracts/state-transition/verifiers/L1VerifierFflonk.sol
+(1622 lines, ~1500 lines of inline Yul assembly)
+
+ARCHITECTURE:
+- Single function `verify()` with massive inline assembly block.
+- Runs on L1 Ethereum, uses EVM precompiles 5 (modexp), 6 (ecAdd),
+  7 (ecMul), 8 (ecPairing).
+- Verifies FFLONK proofs consisting of 4 G1 commitments + 15 evaluations
+  + 1 Montgomery Lagrange basis inverse.
+- Uses Fiat-Shamir transcript for challenge generation.
+- Final check is a BN254 pairing equation.
+
+DETAILED ANALYSIS:
+
+a) BN254 Arithmetic Correctness:
+   - point_mul (line 1496): Uses EVM precompile 7 (ecMul) - correct.
+   - point_add (line 1514): Uses EVM precompile 6 (ecAdd) - correct.
+   - point_sub (line 1535): Negates y-coordinate via sub(Q_MOD, p2_y), then
+     calls ecAdd. This is correct for BN254 point negation.
+   - modexp (line 1607): Uses EVM precompile 5 - correct.
+   - Field arithmetic uses mulmod/addmod with R_MOD throughout - correct.
+
+b) Point-on-curve checks:
+   - All 4 proof commitments (lines 192-231) are checked: y^2 == x^3 + 3 mod Q_MOD.
+   - Values are first reduced mod Q_MOD before the check.
+   - BN254_B_COEFF = 3 is correctly used (hardcoded as literal 3 in the check).
+
+c) Subgroup checks:
+   - BN254 G1 has prime order equal to R_MOD, so any point on the curve is
+     in the correct subgroup. No separate subgroup check needed for G1.
+   - G2 elements are hardcoded verification key constants, not from the proof.
+
+d) Integer overflow in assembly:
+   - All field operations use mulmod/addmod with R_MOD or Q_MOD modulus.
+   - The only raw `sub` operations are for negation: sub(R_MOD, value) and
+     sub(Q_MOD, value). These are safe as long as value < R_MOD/Q_MOD,
+     which is guaranteed by prior mod() reduction.
+   - No overflow vulnerabilities found.
+
+e) Proof element parsing:
+   - Public input: calldataload at publicInputOffset + 0x24, reduced mod R_MOD.
+   - Proof length must equal PROOF_LENGTH (24 words) exactly.
+   - 4 commitments at offsets 0x00-0x100 (8 words for 4 G1 points).
+   - 15 evaluations at subsequent offsets, each reduced mod R_MOD.
+   - 1 Montgomery inverse at the end, reduced mod R_MOD.
+   - Total: 4*2 + 15 + 1 = 24 words. Consistent with PROOF_LENGTH = 24.
+
+f) isValid flag / result accumulation:
+   - The verify function returns the pairing check result directly.
+   - There is no intermediate "isValid" flag that accumulates and could be
+     skipped. The flow is: load -> transcript -> quotients -> openings ->
+     pairing check -> return result.
+   - The pairing check result (0 or 1 from ecPairing precompile) is returned
+     directly as the function result.
+
+POTENTIAL ISSUES:
+
+FINDING: FFLONK point-at-infinity rejection bypasses leave dead code path
+FILE: l1-contracts/contracts/state-transition/verifiers/L1VerifierFflonk.sol
+LINE: 1452-1458
+SEVERITY: Low (Informational)
+IN SCOPE: YES
+DESCRIPTION: The `is_zero_commitment` flag (lines 1452-1458) checks if
+commitment 3 is the point-at-infinity (x=0, y=0). However, the on-curve
+check at lines 222-231 already rejects (0,0) since 0 != 3 (mod Q_MOD).
+For y=0 to pass the on-curve check, we need x^3 = -3 mod Q_MOD, but then
+x != 0 so the check at line 1454 would revert. Therefore is_zero_commitment
+is always 0, making lines 1452-1458 and the conditional at line 1568
+unreachable dead code. The pairing always uses -Y for commitment 3.
+IMPACT: No security impact. Dead code path that can never be reached given
+the on-curve validation earlier in the flow.
+
+FINDING: Transcript state not explicitly zeroed before use
+FILE: l1-contracts/contracts/state-transition/verifiers/L1VerifierFflonk.sol
+LINE: 1469-1478
+SEVERITY: Low (Informational)
+IN SCOPE: YES
+DESCRIPTION: The comment at line 1469 states "The computation assumes that
+the memory slots 0x200 - 0x202 are clean and doesn't explicitly clean them."
+The transcript relies on TRANSCRIPT_STATE_0_SLOT (0x204) and
+TRANSCRIPT_STATE_1_SLOT (0x224) being zero-initialized. In the EVM, memory
+is guaranteed to be zero-initialized, so this is safe. However, if the
+memory layout were ever changed to overlap with earlier computations, this
+assumption could break. The comment acknowledges this design choice.
+IMPACT: No current security impact. Memory is zero-initialized by the EVM.
+
+FINDING: DualVerifier _extractProof uses calldata-to-memory copy for proof routing
+FILE: l1-contracts/contracts/state-transition/verifiers/DualVerifier.sol
+LINE: 87-97
+SEVERITY: Low (Informational)
+IN SCOPE: YES
+DESCRIPTION: The _extractProof function copies proof data from calldata to
+memory (minus the first element), then passes this memory array to the
+verifier. This changes the data location from calldata to memory, which means
+the FFLONK verifier's `calldataload` operations inside its assembly block
+will be reading from the memory-based array passed as a calldata parameter.
+Since Solidity handles the ABI encoding correctly when passing memory arrays
+as function arguments (they get re-encoded into calldata for the external
+call), this works correctly. However, it adds gas overhead for the memory
+copy and re-encoding.
+IMPACT: No security impact. Slightly increased gas cost for proof verification.
+
+FINDING: Public input reduced mod R_MOD without explicit range check
+FILE: l1-contracts/contracts/state-transition/verifiers/L1VerifierFflonk.sol
+LINE: 180
+SEVERITY: Low (Informational)
+IN SCOPE: YES
+DESCRIPTION: The public input at line 180 is reduced with mod(value, R_MOD).
+This means two different calldataload values that are congruent mod R_MOD
+would produce the same proof verification result. For example, a public input
+of X and X + R_MOD would be treated identically. This is standard practice
+in ZK verifiers (the proof system operates over the scalar field), but
+callers should be aware that the on-chain public input is not the exact
+value passed but its reduction modulo R_MOD.
+IMPACT: No direct security impact. Standard behavior for ZK verifiers.
+
+FINDING: Challenge generation uses 253-bit mask (FR_MASK) not full field reduction
+FILE: l1-contracts/contracts/state-transition/verifiers/L1VerifierFflonk.sol
+LINE: 19, 1488
+SEVERITY: Low (Informational)
+IN SCOPE: YES
+DESCRIPTION: FR_MASK = 0x1fff...fff (253 bits). Challenges are generated as
+keccak256(...) & FR_MASK. Since R_MOD is ~254 bits but starts with 0x30644...,
+masking to 253 bits guarantees the result is less than R_MOD (since 2^253 <
+R_MOD). This is a valid approach that avoids bias issues while ensuring the
+challenge is in the correct field. No vulnerability here.
+IMPACT: None. Correct implementation.
+
+================================================================================
+STEP 3 - OTHER CRYPTO PRECOMPILES AUDIT
+================================================================================
+
+All L2 precompiles follow the same thin-wrapper pattern:
+- Copy calldata to memory
+- Pack precompile parameters
+- Call the zkEVM circuit via `precompileCall` (verbatim opcode)
+- Check success + internalSuccess
+- Return result or revert
+
+--- EcAdd.yul (system-contracts/contracts/precompiles/EcAdd.yul) ---
+- Input: 4 words (x1, y1, x2, y2)
+- Validation: Delegated to circuit
+- Output: success flag + (x, y)
+- Failure behavior: REVERT (not return empty like P256Verify)
+- Gas cost: 107 (80000/752)
+- No input validation in the wrapper - all delegated to circuit.
+
+--- EcMul.yul (system-contracts/contracts/precompiles/EcMul.yul) ---
+- Input: 3 words (x, y, scalar)
+- Validation: Delegated to circuit
+- Output: success flag + (x, y)
+- Failure behavior: REVERT
+- Gas cost: 5334 (80000/15)
+- No input validation in the wrapper - all delegated to circuit.
+
+--- EcPairing.yul (system-contracts/contracts/precompiles/EcPairing.yul) ---
+- Input: Variable length, must be multiple of 192 bytes
+- Validation: Checks input length is multiple of CHUNK_SIZE_BYTES (192)
+- Special case: Empty input returns true (line 104-107) - matches EIP-197
+- Gas cost: 80000 per pair (full circuit budget per pair)
+- Gas cost overflow protection at line 130 (cap at UINT32_MAX)
+- Failure behavior: REVERT
+- Burns gas on invalid input length (line 111-112)
+
+--- Ecrecover.yul (system-contracts/contracts/precompiles/Ecrecover.yul) ---
+- Input: 4 words (digest, v, r, s)
+- DOES validate in wrapper: v must be 27 or 28, r and s must be in [1, n-1]
+  where n = SECP256K1_GROUP_SIZE
+- Returns empty on invalid input (matching EVM ecrecover behavior)
+- Gas cost: 7000
+
+FINDING: EcAdd/EcMul revert on failure instead of returning empty (EVM behavior difference)
+FILE: system-contracts/contracts/precompiles/EcAdd.yul
+LINE: 100-101
+SEVERITY: Low (Informational)
+IN SCOPE: YES
+DESCRIPTION: EcAdd and EcMul revert on failure (lines 100-101: revert(0,0)),
+while the EVM precompiles at addresses 0x06 and 0x07 return empty data
+on failure (the call returns success=false). This means contracts migrated
+from Ethereum that rely on try/catch or low-level call() to handle invalid
+curve points will see different behavior: on EVM, the call fails gracefully;
+on ZKsync Era, the precompile call itself reverts, which propagates up.
+However, EcPairing also reverts on failure which matches this pattern.
+IMPACT: Contracts porting from Ethereum that use low-level calls to EcAdd/EcMul
+and check the return value may behave differently on ZKsync Era. The revert
+behavior is actually MORE strict than EVM, so this is unlikely to cause
+security issues but could cause unexpected reverts.
+
+--- SHA256.yul (system-contracts/contracts/precompiles/SHA256.yul) ---
+- Custom padding implementation in Yul (lines 62-81)
+- Follows SHA-256 padding spec: append 0x80, zeros, then 64-bit big-endian length
+- Gas cost: 7 per round (64-byte block)
+- Reverts on circuit failure
+
+FINDING: SHA256 padding potential issue with very large inputs
+FILE: system-contracts/contracts/precompiles/SHA256.yul
+LINE: 68-76
+SEVERITY: Low (Informational)
+IN SCOPE: YES
+DESCRIPTION: The SHA256 precompile calculates padding in Yul. The line
+`let binSize := mul(bytesSize, 8)` (line 74) could theoretically overflow
+for calldatasize > 2^253 bytes. However, this is practically impossible
+since Ethereum transactions have gas limits that prevent such large calldata.
+The gas cost of providing even 2^20 bytes of calldata would be astronomical.
+IMPACT: No practical impact. The overflow is only possible with calldata sizes
+that exceed any realistic gas limit.
+
+--- Modexp.yul (system-contracts/contracts/precompiles/Modexp.yul) ---
+- Supports only 32-byte (256-bit) base, exponent, and modulus
+- Burns gas if any exceed 32 bytes (lines 104-112)
+- Limitation vs EVM: EVM modexp supports arbitrary-length operands
+
+FINDING: Modexp 32-byte limitation differs from EIP-198 specification
+FILE: system-contracts/contracts/precompiles/Modexp.yul
+LINE: 31-45, 104-112
+SEVERITY: Medium
+IN SCOPE: YES
+DESCRIPTION: The ZKsync Era Modexp precompile only supports base, exponent,
+and modulus up to 32 bytes each. The EVM's EIP-198 modexp precompile supports
+arbitrary-length operands. If a contract attempts to use modexp with operands
+larger than 32 bytes on ZKsync Era, the precompile will burn all remaining
+gas and revert (via burnGas()). This could break RSA signature verification
+(which uses 2048-bit / 256-byte moduli) or any cryptographic operation
+requiring large integer modular exponentiation. The burnGas() pattern means
+the caller doesn't get a clean revert - the entire transaction's gas is burned.
+IMPACT: Any contract deployed on ZKsync Era that relies on modexp with operands
+larger than 256 bits will fail catastrophically (all gas burned). This is a
+known limitation but could affect DeFi protocols or bridges that use RSA or
+other large-integer cryptography. The burnGas() behavior is particularly harsh
+compared to a clean revert.
+
+FINDING: Modexp does not validate that calldatasize is sufficient for declared lengths
+FILE: system-contracts/contracts/precompiles/Modexp.yul
+LINE: 99-124
+SEVERITY: Low
+IN SCOPE: YES
+DESCRIPTION: The Modexp precompile reads baseLen, expLen, modLen from
+calldata positions 0, 32, 64 but does not verify that the total calldata
+is at least (96 + baseLen + expLen + modLen) bytes. The calldatacopy at
+lines 122-124 will zero-pad if calldata is shorter than expected (EVM
+calldatacopy behavior), which means providing insufficient calldata would
+result in zero-padded operands rather than an error. This matches EVM
+behavior (calldataload/calldatacopy returns zeros for out-of-bounds) but
+could lead to unexpected results if callers provide truncated input.
+IMPACT: Callers providing insufficient calldata get zero-padded values instead
+of an error. This matches EVM behavior and is unlikely to be exploitable.
+
+================================================================================
+SUMMARY
+================================================================================
+
+No CRITICAL or HIGH severity vulnerabilities found.
+
+Key observations:
+1. P256Verify is a thin wrapper - all crypto is in the zkEVM circuit.
+   Attack surface is minimal in the Yul contract itself.
+
+2. FFLONK verifier is well-constructed with proper field arithmetic,
+   on-curve checks for all proof commitments, and correct pairing equation.
+   The auto-generated nature of the code (from verification key) reduces
+   human error risk.
+
+3. All L2 crypto precompiles delegate to zkEVM circuits, making the Yul
+   wrappers thin and hard to exploit. The main risk vectors would be in
+   the circuit implementations themselves, which are not in the Solidity
+   codebase.
+
+4. The most notable finding is the Modexp 32-byte limitation (Medium severity)
+   which could break contracts expecting EVM-compatible arbitrary-length modexp.
+
+5. EVM behavior differences (EcAdd/EcMul revert vs return-false, gas costs)
+   are informational but important for developers porting contracts.
+
+Total findings: 10 (0 Critical, 0 High, 1 Medium, 9 Low/Informational)

@@ -1,0 +1,343 @@
+===============================================================================
+ZKSYNC AIRBENDER - BLAKE2S 7-ROUND DEEP DIVE ANALYSIS
+===============================================================================
+Date: 2026-03-28
+Target: ZKsync Airbender (RISC-V prover system for ZKsync OS)
+Bounty Program: ZKsync OS on Immunefi
+Max Reward: $100,000 (Critical), $20,000 (High), $5,000 (Medium)
+
+===============================================================================
+1. SCOPE VERIFICATION
+===============================================================================
+
+STATUS: IN SCOPE
+
+The ZKsync OS Immunefi program (live since Nov 24, 2025, updated Mar 21, 2026)
+explicitly lists the zksync-airbender repository as the primary in-scope asset.
+The program covers 84 total assets including circuits, verifiers, and the proof
+system implementation.
+
+In-scope impacts:
+  - Critical: "Direct and publicly triggerable loss of funds"
+  - High: "Invalid ZKsync OS executions provable" (underconstraints)
+  - High: "Valid ZKsync OS executions unprovable" (mismatches)
+  - Medium: "Undocumented deviation from EVM behavior"
+
+Note: The program uses "Primacy of Impact" -- even if a specific file is not
+explicitly listed, if the impact is in scope, the bug qualifies.
+
+Source: https://immunefi.com/bug-bounty/zksync-os/scope/
+
+===============================================================================
+2. CODE ANALYSIS - EXACT LOCATION AND ROUND COUNT
+===============================================================================
+
+FILE: blake2s_u32/src/mixing_function.rs (lines 112-121)
+
+    pub fn round_function_reduced_rounds(
+        state: &mut [u32; BLAKE2S_EXTENDED_STATE_WIDTH_IN_U32_WORDS],
+        message_block: &[u32; BLAKE2S_BLOCK_SIZE_U32_WORDS],
+    ) {
+        for i in 0..7 {          // <-- 7 rounds instead of standard 10
+            let sigma = &SIGMAS[i];
+            mixing_function(state, message_block, sigma);
+        }
+    }
+
+FILE: blake2s_u32/src/lib.rs (lines 19-20)
+
+    pub const BLAKE2S_ROUNDS: usize = 10;
+    pub const BLAKE2S_REDUCED_ROUNDS: usize = 7;
+
+The codebase provides BOTH a full 10-round function and a reduced 7-round
+function. A compile-time const generic bool REDUCED_ROUNDS selects which is
+used.
+
+CRITICAL FINDING: The transcript (Fiat-Shamir) is hardcoded to use reduced
+rounds:
+
+FILE: transcript/src/lib.rs (lines 6-7)
+
+    // const USE_REDUCED_BLAKE2_ROUNDS: bool = false;
+    const USE_REDUCED_BLAKE2_ROUNDS: bool = true;
+
+The commented-out line shows the full-round option exists but is disabled.
+This same pattern appears in:
+  - prover/src/merkle_trees/mod.rs (lines 3-4)
+  - prover/src/definitions/leaf_inclusion_verifier/mod.rs (lines 14-15)
+  - gpu_prover/src/blake2s.rs (line 327)
+
+All of these use USE_REDUCED_BLAKE2_ROUNDS = true.
+
+===============================================================================
+3. HOW BLAKE2S IS USED IN THE PROOF SYSTEM
+===============================================================================
+
+Blake2s with 7 rounds is used for ALL cryptographic operations in Airbender:
+
+A) FIAT-SHAMIR TRANSCRIPT (transcript/src/lib.rs)
+   - commit_initial(): Hashes initial proof data to produce a seed
+   - commit_with_seed(): Hashes seed + new data to produce updated seed
+   - draw_randomness(): Derives random challenges from the seed
+   - verify_pow(): Proof-of-work verification using the hash
+
+B) MERKLE TREE COMMITMENTS (prover/src/merkle_trees/)
+   - Leaf hashing: Blake2s hashes polynomial evaluations into leaf digests
+   - Node compression: compress_two_to_one() merges child digests
+   - Cap computation: Top of the Merkle tree used for commitment
+
+C) PROOF-OF-WORK (transcript/src/pow.rs)
+   - PoW challenge uses reduced-round Blake2s
+   - search_pow() brute-forces nonces with reduced rounds
+
+The Fiat-Shamir transcript is the core security mechanism. It takes:
+  - Prover commitments (Merkle tree caps)
+  - Public inputs
+  - Protocol messages
+And produces:
+  - Random challenges that the prover cannot predict/control
+  - These challenges bind the prover to their committed values
+
+If the hash function is broken, an attacker could:
+  1. Choose proof commitments that produce favorable challenges
+  2. Find colliding transcripts that accept invalid proofs
+  3. Forge proofs for invalid state transitions (fake transactions)
+
+===============================================================================
+4. CRYPTOGRAPHIC SECURITY ANALYSIS OF 7-ROUND BLAKE2S
+===============================================================================
+
+STANDARD BLAKE2S: 10 rounds
+AIRBENDER BLAKE2S: 7 rounds (30% reduction)
+BLAKE3: Also uses 7 rounds (same compression function as Blake2s)
+
+BEST KNOWN ATTACKS ON BLAKE2S (as of early 2026):
+
+A) Collision attacks on the hash function:
+   - Best practical collision: ~2.5 rounds only
+   - At 2.5 rounds: collision security drops from 128 bits to ~112 bits
+   - NO collision attack reaches 7 rounds
+
+B) Boomerang attacks on compression function / keyed permutation:
+   - 7-round boomerang distinguisher: complexity ~2^44 (Type III)
+   - 7.5-round boomerang: complexity ~2^184 (Type I)
+   - 6.5-round boomerang: practical (verified with actual quartets)
+   - These are DISTINGUISHERS on the permutation, NOT collision/preimage
+     attacks on the full hash function
+
+C) Preimage attacks:
+   - Best practical preimage: only 1.5-2 rounds
+   - No preimage attack approaches 7 rounds
+
+D) Rotational cryptanalysis:
+   - Guo et al. (2014) showed rotational distinguishers can "penetrate"
+     all 12 rounds of BLAKE2b, but these are non-practical distinguishers,
+     not collision or preimage attacks
+
+SECURITY MARGIN ASSESSMENT:
+   - Best PRACTICAL attack: ~2.5 rounds
+   - Airbender uses: 7 rounds
+   - Gap: 4.5 rounds above best practical attack
+   - Standard Blake2s: 10 rounds (gap of 7.5 rounds)
+   - The margin is reduced but still substantial
+
+KEY REFERENCES:
+   - Guo et al., "Analysis of BLAKE2" (ePrint 2013/467)
+   - Hao, "Boomerang Attacks on BLAKE and BLAKE2" (ePrint 2014/1012)
+   - Aumasson, "Too Much Crypto" (argues reduced rounds are sufficient)
+   - BLAKE3 specification (uses identical 7-round count)
+
+===============================================================================
+5. IS THIS A KNOWN DESIGN CHOICE?
+===============================================================================
+
+YES - This is a DELIBERATE, DOCUMENTED design choice, not a bug.
+
+Evidence:
+
+A) The code explicitly names the function "round_function_reduced_rounds"
+   and provides both reduced and full variants side by side.
+
+B) The commented-out full-round option shows active decision-making:
+   // const USE_REDUCED_BLAKE2_ROUNDS: bool = false;
+   const USE_REDUCED_BLAKE2_ROUNDS: bool = true;
+
+C) The lib.rs header comment states: "Has options for reduced number of
+   rounds" -- this is a deliberately designed feature.
+
+D) BLAKE3 PRECEDENT: BLAKE3, designed by Jean-Philippe Aumasson (one of
+   the original BLAKE/BLAKE2 designers), uses exactly 7 rounds on the same
+   compression function. The BLAKE3 team's argument: the gap between best
+   known attacks (~2.5 rounds) and 7 rounds provides sufficient security
+   margin. This is the "Too Much Crypto" philosophy.
+
+E) PERFORMANCE MOTIVATION: The Airbender docs note that "BLAKE2s hashing
+   -- for Merkle-tree commitments, transcript updates, or random oracle
+   challenges. The hash function's 10-round compression consumes a lot of
+   instructions." Reducing to 7 rounds gives a ~30% speedup, which is
+   critical for a ZK prover that must hash billions of values.
+
+F) No specific audit report was found that flags this as an issue, though
+   the full audit reports were not available for review. OpenZeppelin audited
+   ZKsync OS and crypto precompiles (March-April 2025) without apparently
+   flagging this.
+
+===============================================================================
+6. FIAT-SHAMIR SECURITY REQUIREMENTS
+===============================================================================
+
+For the Fiat-Shamir transform to be secure, the hash function must behave
+as a "random oracle." In practice, this requires:
+
+A) COLLISION RESISTANCE: An attacker should not be able to find two
+   different transcripts that produce the same challenge. If broken,
+   the attacker could create ambiguous proofs.
+
+B) PREIMAGE RESISTANCE: Given a desired challenge value, the attacker
+   should not be able to find an input that hashes to it. If broken,
+   the attacker could craft proofs targeting specific challenges.
+
+C) PSEUDORANDOMNESS / INDIFFERENTIABILITY: The hash output should be
+   indistinguishable from random. The Fiat-Shamir security of FRI
+   (proven in ASIACRYPT 2023) relies on the hash being modeled as a
+   random oracle.
+
+For 7-round BLAKE2s:
+- Collision resistance: No known attack. Best collision attack reaches
+  only 2.5 rounds. 7 rounds maintains full 128-bit collision resistance
+  as far as current cryptanalysis shows.
+- Preimage resistance: No known attack beyond 2 rounds.
+- Indifferentiability: The boomerang distinguisher at 7 rounds (2^44)
+  is on the KEYED PERMUTATION, not the hash function in Merkle-Damgard
+  mode. The hash function itself has additional protections (Davies-Meyer
+  feed-forward, IV, finalization) that prevent permutation-level
+  distinguishers from translating to hash-level attacks.
+
+===============================================================================
+7. EXPLOITABILITY ASSESSMENT
+===============================================================================
+
+CAN AN ATTACKER EXPLOIT 7-ROUND BLAKE2S TO FORGE ZK PROOFS?
+
+SHORT ANSWER: NO, not with any currently known technique.
+
+Detailed analysis:
+
+A) FORGE A VALID PROOF FOR AN INVALID STATEMENT?
+   This requires either:
+   - Finding preimages/collisions in the Fiat-Shamir transcript
+   - Best known: No attack beyond 2.5 rounds. NOT EXPLOITABLE.
+
+B) CREATE COLLIDING FIAT-SHAMIR CHALLENGES?
+   - Requires collision attack on 7-round Blake2s hash function
+   - No such attack exists in the literature
+   - Best collision attack: 2.5 rounds with complexity ~2^112
+   - NOT EXPLOITABLE.
+
+C) MANIPULATE THE VERIFIER VIA MERKLE TREE COLLISIONS?
+   - Requires second-preimage or collision on compress_two_to_one
+   - This function applies Blake2s compression as a fixed-length hash
+   - No known attack. NOT EXPLOITABLE.
+
+D) BOOMERANG DISTINGUISHER EXPLOITATION?
+   - The 7-round boomerang (2^44 complexity) attacks the KEYED
+     PERMUTATION, not the hash function
+   - To translate this to a Fiat-Shamir attack, you would need to:
+     * Control the internal state (you cannot; it's determined by IV + data)
+     * Find related-key pairs (irrelevant; no key in hash mode)
+     * Convert a distinguisher to a collision (major open problem)
+   - NOT EXPLOITABLE.
+
+E) COMPUTATIONAL RESOURCES?
+   - Even the theoretical attacks don't reach 7 rounds
+   - A GTX 1080 or cloud setup is irrelevant when no attack exists
+   - The question is not "can we compute it" but "does an algorithm exist"
+   - NO KNOWN ALGORITHM EXISTS for attacking 7-round Blake2s hash function.
+
+F) FUTURE ATTACK RISK?
+   - The security margin IS reduced from 7.5 rounds (standard) to 4.5 rounds
+   - If cryptanalysis improves significantly, 7 rounds could eventually fall
+     before 10 rounds
+   - However, this is speculative and not a current vulnerability
+   - BLAKE3 (used by many systems) makes the exact same bet
+
+===============================================================================
+8. COMPARISON WITH BLAKE3
+===============================================================================
+
+BLAKE3 uses 7 rounds of the BLAKE2s compression function. This is an
+industry-accepted design by one of BLAKE2's original designers.
+
+If 7-round BLAKE2s were insecure, then:
+- BLAKE3 would be broken (used widely in production systems)
+- Every system using BLAKE3 for Merkle trees would be vulnerable
+- This would be a major cryptographic discovery, not a bug bounty finding
+
+Airbender's use of 7 rounds is essentially implementing the same security
+argument as BLAKE3 but applying it directly to the BLAKE2s compression
+function rather than going through BLAKE3's different tree mode.
+
+===============================================================================
+9. RECOMMENDATION
+===============================================================================
+
+RECOMMENDATION: DO NOT SUBMIT
+
+Rationale:
+
+1. This is a DELIBERATE DESIGN CHOICE, not a vulnerability. The code
+   explicitly names and documents the reduced round variant.
+
+2. The cryptographic security margin is SUFFICIENT. Best known attacks
+   reach only 2.5 rounds; 7 rounds provides 4.5 rounds of margin.
+
+3. BLAKE3 PRECEDENT makes this an industry-accepted trade-off. A bounty
+   report arguing "7 rounds is insufficient" would need to present a
+   novel cryptanalytic attack, which we do not have.
+
+4. No PRACTICAL or even THEORETICAL attack exists that reaches 7-round
+   Blake2s at the hash function level. The boomerang distinguisher at
+   7 rounds is on the keyed permutation only.
+
+5. Immunefi programs typically reject design choice disagreements. The
+   report would likely be closed as "informational" or "design decision."
+
+6. The bounty program specifically looks for:
+   - Direct loss of funds (requires actual exploit)
+   - Invalid executions provable (requires forging proofs)
+   Neither is achievable with current cryptanalytic knowledge.
+
+POTENTIAL COUNTERARGUMENT (why one MIGHT submit):
+- The security margin is reduced from standard (7.5 rounds) to narrower
+  (4.5 rounds above best attack)
+- If a breakthrough in BLAKE2 cryptanalysis occurs, 7-round systems would
+  fall before 10-round systems
+- Some conservative cryptographers would prefer the full 10 rounds
+- However, this is a design philosophy disagreement, not a vulnerability
+
+===============================================================================
+10. SUMMARY
+===============================================================================
+
+Finding: ZKsync Airbender uses 7-round Blake2s (instead of standard 10)
+         for ALL cryptographic operations: Fiat-Shamir transcript, Merkle
+         trees, and proof-of-work.
+
+Security Impact: NONE with current cryptanalytic knowledge.
+  - No collision attack exists beyond 2.5 rounds
+  - No preimage attack exists beyond 2 rounds
+  - 7-round boomerang distinguisher (2^44) is on permutation, not hash
+  - BLAKE3 uses the same 7-round count and is considered secure
+
+Exploitability: NOT EXPLOITABLE with any known technique.
+
+Design Justification: Performance optimization following BLAKE3/Aumasson
+  "Too Much Crypto" philosophy. 30% speedup in hash computation is
+  significant for a ZK prover processing billions of hashes.
+
+Verdict: Known, deliberate design choice. Not a vulnerability.
+         DO NOT SUBMIT to Immunefi.
+
+===============================================================================
+END OF ANALYSIS
+===============================================================================

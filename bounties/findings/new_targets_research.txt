@@ -1,0 +1,387 @@
+================================================================================
+IMMUNEFI BUG BOUNTY - CRYPTOGRAPHIC VULNERABILITY TARGET RESEARCH
+Generated: 2026-03-28
+Focus: Elliptic curve crypto, ECDSA/Ed25519, field arithmetic, ZK proofs,
+       hash functions, key generation/entropy (C/Rust/Solidity)
+================================================================================
+
+TABLE OF CONTENTS
+  1. Executive Summary
+  2. Top 5 Priority Targets (Detailed Profiles)
+  3. Secondary Targets (Worth Monitoring)
+  4. Disqualified Targets
+  5. Methodology Notes
+
+================================================================================
+1. EXECUTIVE SUMMARY
+================================================================================
+
+After surveying 15+ Immunefi programs, we identified 5 high-priority targets
+where our cryptographic specialization gives us a meaningful edge. The best
+opportunities are in:
+
+  - ZK rollup proof systems (STARK/FRI/PLONK verifiers in Rust)
+  - Cross-chain bridge signature verification (custom VAA/DVN schemes)
+  - Validator clients written in C (memory-unsafe crypto primitives)
+
+Total addressable bounty pool across top 5: ~$17.2M
+Estimated realistic payout range: $30K-$500K per finding
+
+================================================================================
+2. TOP 5 PRIORITY TARGETS (DETAILED PROFILES)
+================================================================================
+
+------------------------------------------------------------------------------
+TARGET #1: ZKsync OS / Airbender (STARK/FRI Proof System)
+------------------------------------------------------------------------------
+URL: https://immunefi.com/bug-bounty/zksync-os/
+MAX BOUNTY: $100,000 (critical)
+SCOPE VERIFIED: YES
+  - 84 in-scope assets across 3 repos:
+    * github.com/matter-labs/zksync-airbender
+    * github.com/matter-labs/zksync-os
+    * github.com/matter-labs/zkos-wrapper
+  - Full RV32I+M ISA machine configuration
+  - Decoder/constraint systems
+  - Delegation circuits (BigInt, BLAKE2s)
+
+CRYPTO CODE:
+  - STARK/FRI proof system (custom implementation, not off-the-shelf)
+  - Mersenne field operations and extensions
+  - FRI folding and commitment schemes
+  - BigInt delegation circuits
+  - BLAKE2s delegation circuits
+  - RISC-V bytecode execution proving
+
+LANGUAGES: Rust (primary), some C/C++
+
+PRIOR AUDITS: Documented at docs.zksync.io/zksync-protocol/security/audits
+  (unfixed audit vulns are ineligible)
+
+OUR EDGE:
+  - Custom STARK/FRI implementation in Rust = high complexity, high bug density
+  - Field arithmetic (Mersenne field) is notoriously tricky to implement correctly
+  - FRI folding/commitment schemes have subtle soundness issues
+  - Relatively new codebase (live since Nov 2025) with less researcher coverage
+  - $1.6M ZK tokens allocated for 2026 bounty funding = well-funded program
+  - The team intentionally planted a Medium-severity bug as a challenge
+
+ESTIMATED EFFORT: 3-6 weeks deep review of proof system internals
+PRIORITY: 1 (HIGHEST)
+RATIONALE: Perfect match for our ZK/field arithmetic skills. New codebase in
+  Rust with custom STARK/FRI. Lower max bounty but higher probability of finding
+  something. Good entry point.
+
+------------------------------------------------------------------------------
+TARGET #2: ZKsync Era (ZK Circuits + Verifier Contracts)
+------------------------------------------------------------------------------
+URL: https://immunefi.com/bug-bounty/zksyncera/
+MAX BOUNTY: $1,100,000 (critical smart contracts)
+SCOPE VERIFIED: YES
+  - L1 Smart Contracts: DiamondProxy, ExecutorFacet, MailboxFacet
+  - ZK Verifiers: DualVerifier, L1VerifierFflonk, PlonkVerifier
+  - L2 Precompiles: Ecrecover, EcAdd, EcMul, EcPairing, P256Verify
+  - Circuits: storage, main VM, ecrecover, log demuxer, recursion, scheduler
+  - Repos: matter-labs/zksync-era, era-contracts, zksync-protocol
+
+CRYPTO CODE:
+  - PLONK and FFLONK verifier contracts (Solidity on L1)
+  - Elliptic curve precompiles: EcAdd, EcMul, EcPairing (BN254 curve ops)
+  - P256Verify (secp256r1 signature verification)
+  - Ecrecover (secp256k1 ECDSA)
+  - ZK-SNARK circuit implementations
+  - SNARK wrapper component (prover)
+
+LANGUAGES: Solidity, Yul (assembly), Vyper; circuit code in protocol repo
+
+PRIOR AUDITS: Multiple audits documented; well-audited but large attack surface
+
+OUR EDGE:
+  - EcAdd/EcMul/EcPairing precompiles are custom BN254 implementations
+  - P256Verify is a newer addition (secp256r1) - less battle-tested
+  - FFLONK verifier is a complex piece of Solidity doing pairing checks
+  - PlonkVerifier has subtle field arithmetic in Solidity/Yul
+  - The circuit layer (ecrecover circuit, recursion) is a huge attack surface
+  - Minimum $100K payout for critical = good floor
+
+ESTIMATED EFFORT: 4-8 weeks (circuits + verifier contracts)
+PRIORITY: 2
+RATIONALE: Massive bounty, direct match for our BN254/PLONK/ECDSA skills.
+  Well-audited but the sheer complexity of circuits + verifiers means bugs
+  persist. The precompile implementations are prime targets.
+
+------------------------------------------------------------------------------
+TARGET #3: Firedancer (Solana Validator Client in C)
+------------------------------------------------------------------------------
+URL: https://immunefi.com/bug-bounty/firedancer/
+MAX BOUNTY: $500,000 (critical)
+SCOPE VERIFIED: YES
+  - github.com/firedancer-io/firedancer/tree/main
+  - All code reachable by fdctl binary main function
+  - FFI interface between C (Firedancer) and Rust (Agave)
+  - Crypto implementations behind dev flags are in-scope but informational
+
+CRYPTO CODE:
+  - Ed25519 signature verification (custom C implementation)
+  - SHA-256 and other hash function implementations
+  - Transaction signature batch verification
+  - Key generation and entropy handling
+  - All Solana cryptographic primitives reimplemented in C
+
+LANGUAGES: C (primary), Rust (FFI interface)
+
+PRIOR AUDITS: Available at github.com/firedancer-io/audits
+  (unfixed audit vulns ineligible)
+
+OUR EDGE:
+  - ~200,000 lines of C code = memory safety bugs in crypto paths
+  - Ed25519 reimplementation in C is extremely high-risk
+  - Hash function implementations in C (off-by-one, buffer issues)
+  - FFI boundary between C and Rust is a classic bug source
+  - CEO of Immunefi publicly stated he expects DOS conditions due to
+    memory-unsafe codebase
+  - Low-latency trading background of devs may prioritize speed over safety
+
+ESTIMATED EFFORT: 4-8 weeks focused on crypto primitives and FFI boundary
+PRIORITY: 3
+RATIONALE: C crypto code is where we find bugs. Ed25519 in C, hash functions
+  in C, and the C-Rust FFI boundary are all prime targets. The codebase is
+  large but we can focus narrowly on crypto paths.
+
+------------------------------------------------------------------------------
+TARGET #4: Wormhole (Cross-Chain Bridge, VAA Verification)
+------------------------------------------------------------------------------
+URL: https://immunefi.com/bug-bounty/wormhole/
+MAX BOUNTY: $1,000,000 (Tier 1 - extract TVL all chains)
+  Tier 2: $500,000 (single chain TVL)
+  Tier 3: $250,000 (deny access to TVL)
+SCOPE VERIFIED: YES
+  - 13 in-scope assets across multiple chains
+  - Guardian Nodes (Go/Rust)
+  - Smart contracts: Ethereum, Solana, CosmWasm, Algorand, Aptos, Sui, Near
+  - Native Token Transfers
+  - MultiGov (capped at $100K)
+
+CRYPTO CODE:
+  - VAA (Verifiable Action Approval) signature verification
+  - Guardian message signing (multi-sig scheme)
+  - Custom signature aggregation across 19 guardians
+  - Each chain has its own signature verification implementation
+  - Solana: Ed25519 verification
+  - EVM: ECDSA/secp256k1
+  - Sui/Aptos: Ed25519/BLS
+  - Near: Ed25519
+  - CosmWasm: secp256k1
+
+LANGUAGES: Go, Rust, Solidity, Move, Python
+
+PRIOR AUDITS: Previously paid $10M bounty (largest ever). Well-audited but
+  multi-chain complexity means edge cases persist.
+
+OUR EDGE:
+  - Multi-chain signature verification = many implementations to compare
+  - VAA verification logic across 7+ chains creates inconsistency bugs
+  - Guardian threshold signature scheme is custom
+  - Each new chain integration (Sui, Aptos, Near) adds new crypto code
+  - Bridge = highest impact category (direct fund theft)
+  - Historical: $22.3M signature malleability bug was found on similar bridge
+
+ESTIMATED EFFORT: 6-10 weeks (must review multiple chain implementations)
+PRIORITY: 4
+RATIONALE: Huge bounty and perfect attack surface (custom multi-chain signature
+  verification). However, heavily audited and well-funded security team. The
+  edge is in newer chain integrations and cross-chain inconsistencies.
+
+------------------------------------------------------------------------------
+TARGET #5: LayerZero (Cross-Chain Messaging, DVN Verification)
+------------------------------------------------------------------------------
+URL: https://immunefi.com/bug-bounty/layerzero/
+MAX BOUNTY: $15,000,000 (critical smart contracts) - LARGEST ON IMMUNEFI
+SCOPE VERIFIED: YES
+  - github.com/LayerZero-Labs
+  - EndpointV2, UltraLightNodeV2, FPValidator
+  - SendULN301/302, ReceiveULN301/302 (EVM & Solana)
+  - DVN contracts (Ethereum, Solana, TON)
+  - OApp, OFT (EVM & Solana)
+  - TON contracts: Controller, ULNManager, DVNProxy
+
+CRYPTO CODE:
+  - DVN (Decentralized Verifier Network) signature verification
+  - Message hash verification across chains
+  - UltraLightNode verification logic
+  - FPValidator (fingerprint validation)
+  - Cross-chain message authentication
+  - TON-specific cryptographic verification (newer, less audited)
+
+LANGUAGES: Solidity (primary), Rust (Solana), Move (Aptos)
+
+PRIOR AUDITS: Audit reports at github.com/LayerZero-Labs/Audits
+  (known vulns ineligible). ~$1M already paid to whitehats.
+
+OUR EDGE:
+  - $15M max bounty = highest reward on entire platform
+  - DVN verification is a custom signature scheme (not standard ECDSA.recover)
+  - TON integration is newer and less battle-tested
+  - Solana DVN implementation in Rust = our specialty
+  - Multi-chain verification creates inconsistency opportunities
+  - OFT/ONFT impacts are capped at Low severity (focus on core messaging)
+  - Related: USDT0 program ($6M max) built on LayerZero OFT
+
+ESTIMATED EFFORT: 4-8 weeks (focus on DVN verification + newer integrations)
+PRIORITY: 5
+RATIONALE: Astronomical max bounty. DVN verification is custom crypto. TON and
+  Solana implementations are newer attack surface. However, heavily scrutinized
+  by top researchers given the bounty size.
+
+================================================================================
+3. SECONDARY TARGETS (WORTH MONITORING)
+================================================================================
+
+TARGET: Scroll (ZK Rollup)
+URL: https://immunefi.com/bug-bounty/scroll/
+MAX BOUNTY: $1,000,000
+SCOPE VERIFIED: YES (36 smart contracts + l2geth)
+CRYPTO CODE: ZkEvmVerifierV1, MultipleVersionRollupVerifier, zkTrie
+LANGUAGES: Go, Solidity
+PRIOR AUDITS: Trail of Bits, OpenZeppelin, Zellic (extensive)
+STATUS: Strong target but heavily audited. Verifier contracts are Solidity.
+  NOTE: Polygon zkEVM is being sunset in 2026 - researchers may migrate here.
+OUR EDGE: Verifier contract bugs, but mostly Solidity (less our strength)
+PRIORITY: 6
+
+TARGET: StarkNet (STARK Verifier)
+URL: https://immunefi.com/bug-bounty/starknet/
+MAX BOUNTY: $500,000 (critical, min $40K)
+SCOPE VERIFIED: YES (starkware-libs repos, starkgate-contracts)
+CRYPTO CODE: Cairo VM, STARK proof verification, ec.cairo (elliptic curve ops),
+  hash functions, signature primitives, merkle trees
+LANGUAGES: Cairo, Solidity
+PRIOR AUDITS: Multiple (StarkWare has extensive security program)
+STATUS: Interesting crypto in Cairo but Cairo is a niche language requiring
+  ramp-up time. ec.cairo and hash primitives are worth examining.
+OUR EDGE: Elliptic curve operations in Cairo, STARK verification logic
+PRIORITY: 7
+
+TARGET: Polygon zkEVM
+URL: https://immunefi.com/bug-bounty/polygonzkevm/
+MAX BOUNTY: $1,000,000
+SCOPE VERIFIED: YES (smart contracts + blockchain)
+CRYPTO CODE: ZK-SNARK circuits, verifier contracts, prover
+STATUS: BEING SUNSET IN 2026. Still active but Polygon Labs announced
+  deprecation. Lower priority given wind-down, but "primacy of impact"
+  exception means out-of-scope bugs may still qualify.
+OUR EDGE: ZK circuit bugs during transition period (less attention from devs)
+PRIORITY: 8
+
+TARGET: Linea (zkEVM by Consensys)
+URL: https://immunefi.com/bug-bounty/linea/
+MAX BOUNTY: $100,000
+SCOPE VERIFIED: YES (6 smart contracts + primacy of impact)
+CRYPTO CODE: ZkEvmV2.sol, LineaRollup.sol (PLONK verifier referenced in audits)
+LANGUAGES: Solidity
+PRIOR AUDITS: Consensys Diligence, OpenZeppelin, Cyfrin (extensive through 2025)
+STATUS: Low max bounty ($100K). Verifier is in-scope but mostly Solidity.
+  Heavily audited by parent company (Consensys Diligence).
+OUR EDGE: Limited - well-audited, Solidity-only, low bounty
+PRIORITY: 9
+
+TARGET: Chainlink (Oracle Network)
+URL: https://immunefi.com/bug-bounty/chainlink/
+MAX BOUNTY: $3,000,000
+SCOPE VERIFIED: YES (25 assets - EVM contracts, Solana, Sui, Aptos, core node)
+CRYPTO CODE: OCR (Off-Chain Reporting) signature aggregation, VRF (Verifiable
+  Random Function), CCIP message verification, common keystore, libocr
+LANGUAGES: Solidity, Go, Rust, TypeScript
+PRIOR AUDITS: Extremely well-audited (Chainlink has massive security budget)
+STATUS: High bounty but extremely mature and well-audited. OCR and VRF are
+  interesting but have been reviewed by top firms many times.
+OUR EDGE: CCIP cross-chain verification on newer chains (Sui, Aptos, Solana).
+  Keystore implementation. But competition is fierce.
+PRIORITY: 10
+
+TARGET: zkVerify (Proof Verification Layer)
+URL: https://immunefi.com/bug-bounty/zkverify/
+MAX BOUNTY: $50,000
+SCOPE VERIFIED: YES (zkVerify repo, zkVerifyJS, zkverify.io)
+CRYPTO CODE: ZK proof verification infrastructure (Rust, Polkadot-based)
+LANGUAGES: Rust
+PRIOR AUDITS: Trail of Bits (Feb 2025), SRLabs (Sep 2025)
+STATUS: Interesting Rust ZK code but low max bounty ($50K).
+  "Everything is in scope except Hyperbridge."
+OUR EDGE: Rust proof verification code, newer protocol
+PRIORITY: 11
+
+================================================================================
+4. DISQUALIFIED TARGETS
+================================================================================
+
+DISQUALIFIED: Cosmos/IBC
+REASON: Bug bounty is on HackerOne, NOT Immunefi. Injective (on Immunefi)
+  explicitly excludes Cosmos-SDK/IBC/CometBFT vulnerabilities.
+
+DISQUALIFIED: Sui
+REASON: Could not verify current active Immunefi listing with detailed scope.
+  Program exists but max bounty and specific crypto assets unclear. The
+  Move bytecode verifier is interesting but requires Move expertise.
+
+DISQUALIFIED: Aptos
+REASON: No dedicated Aptos L1 bounty found on Immunefi. Econia (DeFi on Aptos)
+  has $100K max but is pure DeFi logic, not crypto primitives.
+
+DISQUALIFIED: Polkadot (sr25519)
+REASON: No dedicated Polkadot L1 bounty found on Immunefi for core
+  sr25519/crypto. Web3 Foundation runs separate security programs.
+
+DISQUALIFIED: Near Protocol
+REASON: No dedicated Near Protocol bounty found on Immunefi. Near's Ed25519
+  implementation is interesting but no Immunefi program to target.
+
+DISQUALIFIED: Most pure Solidity DeFi protocols
+REASON: Crypto is just OpenZeppelin ECDSA.recover imports. No custom
+  cryptographic code. Does not match our skill set.
+
+================================================================================
+5. METHODOLOGY NOTES
+================================================================================
+
+SEARCH METHODOLOGY:
+  - Web searches for: "immunefi bug bounty cryptographic signature verification",
+    "immunefi ZK proof verifier", "immunefi bridge signature", "immunefi ECDSA
+    Ed25519", "immunefi highest bounty programs"
+  - Direct visits to 12+ Immunefi program pages
+  - Scope verification via program scope tabs and GitHub repos
+  - Cross-referenced with Immunefi Top 10 vulnerability categories
+
+EVALUATION CRITERIA (weighted):
+  1. Custom crypto code presence (not just OZ imports)     - 30%
+  2. Language risk (C > Rust > Solidity)                   - 20%
+  3. Max bounty amount                                     - 15%
+  4. Protocol age / audit coverage                         - 15%
+  5. Complexity of crypto (ZK > signatures > hashing)      - 10%
+  6. Bridge/cross-chain (higher impact)                    - 10%
+
+KEY OBSERVATIONS:
+  - ZK rollup proof systems offer the best match for our skills
+  - C/Rust crypto code has higher bug density than Solidity
+  - Newer chain integrations on bridges are under-audited
+  - $15M LayerZero bounty attracts top researchers (high competition)
+  - ZKsync ecosystem has 3 separate programs (OS, Era, Lite) - good coverage
+  - Polygon zkEVM sunset creates a window (less developer attention)
+  - Cosmos/IBC is NOT on Immunefi (HackerOne instead)
+
+RECOMMENDED STRATEGY:
+  1. START with ZKsync OS/Airbender - newest, Rust, STARK/FRI, high probability
+  2. THEN ZKsync Era circuits/verifiers - same ecosystem, huge bounty
+  3. IN PARALLEL: Firedancer C crypto paths (different skill set, no overlap)
+  4. LONG-TERM: Wormhole newer chain integrations, LayerZero TON/Solana DVNs
+
+RISK ASSESSMENT:
+  - ZKsync OS: Medium effort, Medium-High probability, $30K-$100K expected
+  - ZKsync Era: High effort, Medium probability, $100K-$1.1M expected
+  - Firedancer: High effort, Medium-High probability, $50K-$500K expected
+  - Wormhole: Very high effort, Low-Medium probability, $100K-$1M expected
+  - LayerZero: High effort, Low probability, $50K-$15M expected
+
+================================================================================
+END OF REPORT
+================================================================================
