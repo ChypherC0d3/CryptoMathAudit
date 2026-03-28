@@ -1,6 +1,8 @@
-# CryptoMathAudit
+# CryptoMathAudit (CMA)
 
 **Cryptographic vulnerability research through mathematics, not guessing.**
+
+> CryptoMathAudit (CMA) is a cybersecurity and applied mathematics research initiative born from [**Chronos Technology**](https://c5s.xyz). We combine deep mathematical expertise in elliptic curve cryptography with GPU-accelerated tooling to audit the cryptographic foundations of blockchain protocols. Our mission is to identify and responsibly disclose vulnerabilities before they can be exploited.
 
 We specialize in **elliptic curve cryptography**, **ECDSA implementation flaws**, and **GPU-accelerated security auditing** of blockchain protocols. Our focus is the mathematical foundation that secures billions of dollars in digital assets.
 
@@ -123,10 +125,20 @@ All vulnerabilities are reported through official channels **before** public dis
 
 ---
 
+## Contact
+
+CryptoMathAudit is a research division of [**Chronos Technology**](https://c5s.xyz).
+
+For collaborations, responsible disclosure coordination, or inquiries:
+
+**team@c5s.xyz**
+
+---
+
 ## License
 
 MIT License. See [LICENSE](LICENSE).
 
 ---
 
-*Mathematics doesn't lie. Neither do we.*
+*A [Chronos Technology](https://c5s.xyz) initiative. Mathematics doesn't lie. Neither do we.*
