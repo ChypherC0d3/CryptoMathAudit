@@ -1,0 +1,88 @@
+ZKSYNC OS BUG BOUNTY - IMMUNEFI ASSET SCOPE VERIFICATION
+=========================================================
+Date: 2026-03-28
+Purpose: Identify the EXACT asset to select when submitting our bug report
+
+==========================================================================
+ANSWER: SELECT "EVM interpreter" ASSET
+==========================================================================
+
+EXACT ASSET DETAILS:
+  Name:    "EVM interpreter"
+  Type:    Blockchain/DLT
+  URL:     https://github.com/matter-labs/zksync-os/tree/4af87fdb6d30b8215d4affd81e6e5e9a8dbf8f52/evm_interpreter/
+  Added:   2025-11-24
+
+This asset directly covers the evm_interpreter/ directory in the zksync-os
+repository at commit 4af87fdb, which contains our bug file:
+  evm_interpreter/src/instructions/environment.rs
+
+==========================================================================
+CRITICAL: SUBMIT TO ZKSYNC OS, NOT ZKSYNC ERA
+==========================================================================
+
+There are TWO separate ZKsync bounties on Immunefi:
+
+1. ZKsync OS  - https://immunefi.com/bug-bounty/zksync-os/
+   -> This is the CORRECT one for our bug
+   -> Covers the zksync-os repo (evm_interpreter, bootloader, oracles, etc.)
+   -> Covers the zksync-airbender repo (circuits, prover)
+   -> Covers the zkos-wrapper repo (verifier)
+   -> 84 assets total
+   -> Max bounty: $100,000 (Critical), $20,000 (High), $5,000 (Medium)
+   -> Commit in scope: 4af87fdb6d30b8215d4affd81e6e5e9a8dbf8f52
+
+2. ZKsync Era - https://immunefi.com/bug-bounty/zksyncera/
+   -> WRONG bounty for our bug
+   -> Covers EraVM circuits, smart contracts, block explorer, web APIs
+   -> Does NOT list evm_interpreter or zksync-os repo
+   -> This is the older/legacy system
+
+The previous Hyperlane report was rejected likely because it was submitted
+to the wrong bounty program or the wrong asset was selected within it.
+
+==========================================================================
+ALL ZKSYNC-OS REPO ASSETS IN SCOPE (for reference)
+==========================================================================
+
+Assets from github.com/matter-labs/zksync-os at commit 4af87fdb:
+
+  1. "EVM interpreter"         -> evm_interpreter/         ** OUR TARGET **
+  2. "ZK Execution Environment" -> zk_ee/
+  3. "ZKsync OS program"       -> zksync_os/
+  4. "Basic bootloader"        -> basic_bootloader/
+  5. "Callable oracles"        -> callable_oracles/
+  6. "Oracle provider"         -> oracle_provider/
+  7. "Storage models"          -> storage_models/
+  8. "System hooks"            -> system_hooks/
+  9. "Supporting crates"       -> supporting_crates/ (delegated_u256, modexp, u256)
+  10. "Proof running system"   -> proof_running_system/
+
+==========================================================================
+NOTE ON "PRIMACY OF IMPACT"
+==========================================================================
+
+The ZKsync OS bounty uses "Primacy of Impact" policy. This means:
+- Impact is prioritized over the specific asset
+- There is a special "Primacy of Impact" asset placeholder listed
+- However, you should STILL select the correct specific asset ("EVM interpreter")
+  when the bug clearly falls within a named in-scope asset
+- The "Primacy of Impact" placeholder is for bugs that have in-scope impact
+  but affect assets not explicitly listed
+
+For our bug in evm_interpreter/src/instructions/environment.rs:
+  -> Select: "EVM interpreter" (the specific, correct asset)
+  -> Do NOT select "Primacy of Impact" unless instructed otherwise
+
+==========================================================================
+SUBMISSION CHECKLIST
+==========================================================================
+
+[ ] Bounty program: ZKsync OS (NOT ZKsync Era)
+[ ] URL: https://immunefi.com/bug-bounty/zksync-os/
+[ ] Asset: "EVM interpreter"
+[ ] Asset type: Blockchain/DLT
+[ ] Commit: 4af87fdb6d30b8215d4affd81e6e5e9a8dbf8f52
+[ ] File: evm_interpreter/src/instructions/environment.rs
+[ ] PoC: Required for all severities
+[ ] KYC: Required for payout

@@ -1,0 +1,150 @@
+===============================================================================
+HYPOTHESIS H6: AVX512 vs Reference Ed25519 Differential Test Results
+===============================================================================
+Date: 2026-03-28
+Status: COMPLETED - NO DIVERGENCE FOUND
+
+===============================================================================
+1. TEST ENVIRONMENT
+===============================================================================
+
+Host: Windows 10 / WSL2 (Ubuntu 24.04)
+CPU:  Intel i7-7700K (Kaby Lake, NO native AVX512)
+GCC:  13.3.0
+SDE:  Intel SDE 9.44.0 (2024-08-22) - Ice Lake emulation mode (-icl)
+
+Firedancer repo: /tmp/firedancer (main branch)
+
+Reference build:  MACHINE=linux_gcc_minimal
+  - No AVX512, uses ref/ field arithmetic (5x51-bit limbs, fiat-crypto)
+  - Library: build/linux/gcc/minimal/lib/libfd_ballet.a
+
+AVX512 build:     MACHINE=linux_gcc_icelake_wsl (custom config)
+  - FD_HAS_AVX512=1, uses avx512/ field arithmetic (6x43-bit r43x6)
+  - Library: build/linux/gcc/icelake_wsl/lib/libfd_ballet.a
+  - Executed under Intel SDE -icl (Ice Lake emulation)
+
+===============================================================================
+2. TEST METHODOLOGY
+===============================================================================
+
+Wrote a C test program (/tmp/diff_test.c, also at F:\Claude\diff_test.c) that:
+
+Part 1: Sign-then-Verify sanity check
+  - Generate keypair from fixed private key (0x42 repeated)
+  - Sign message "Hello Firedancer H6 test"
+  - Verify good signature, flipped-sig, flipped-msg
+
+Part 2: 20 edge case vectors targeting potential ref/avx512 divergence:
+  - Small-order public keys (identity, order-2, order-4, order-8)
+  - Non-canonical encodings (y >= p, y = p+1, y = 2^255-1)
+  - Boundary S values (S=0, S=L-1, S=L where L = group order)
+  - Non-canonical R points (y=p, y=p+1)
+  - Small-order R with valid pubkey
+  - Point not on curve
+  - All-FF signature
+  - High-bit-set encodings
+
+Compiled the SAME test source against BOTH libraries and compared
+stdout output byte-for-byte.
+
+===============================================================================
+3. RESULTS
+===============================================================================
+
+Reference (minimal) output:
+
+  === Part 1: Sign-then-Verify Sanity ===
+  sign-then-verify:   ACCEPT (rc=0)
+  flipped-sig-verify: REJECT (rc=-3)
+  flipped-msg-verify: REJECT (rc=-3)
+
+  === Part 2: Edge Case Vectors ===
+  Vectors: 20
+
+  zero-pubkey                    => REJECT_PUB   (rc=-2)
+  identity-pubkey                => REJECT_PUB   (rc=-2)
+  order2-pubkey                  => REJECT_PUB   (rc=-2)
+  order8-pubkey                  => REJECT_PUB   (rc=-2)
+  order8-pubkey-2                => REJECT_PUB   (rc=-2)
+  noncanon-pub-y=p               => REJECT_PUB   (rc=-2)
+  noncanon-pub-y=p+1             => REJECT_PUB   (rc=-2)
+  noncanon-pub-y=2^255-1         => REJECT_SIG   (rc=-1)
+  pub-highbit-y=0                => REJECT_PUB   (rc=-2)
+  S=L R=id pub=id                => REJECT_SIG   (rc=-1)
+  S=L-1 R=id pub=id              => REJECT_PUB   (rc=-2)
+  S=0 R=id pub=id                => REJECT_PUB   (rc=-2)
+  noncanon-R y=p                 => REJECT_SIG   (rc=-1)
+  noncanon-R y=p+1               => REJECT_SIG   (rc=-1)
+  all-ff-sig                     => REJECT_SIG   (rc=-1)
+  R=order8 S=0                   => REJECT_SIG   (rc=-1)
+  S=L-1 msg=test valid-pub       => REJECT_SIG   (rc=-1)
+  noncanon-R y=p S=1             => REJECT_SIG   (rc=-1)
+  pub-not-on-curve               => REJECT_PUB   (rc=-2)
+  order4-pubkey                  => REJECT_SIG   (rc=-1)
+
+AVX512 (icelake, SDE emulated) output:
+  IDENTICAL to reference (verified via diff)
+
+diff /tmp/ref_output.txt /tmp/avx512_output.txt => NO DIFFERENCES
+
+===============================================================================
+4. ANALYSIS
+===============================================================================
+
+All 20 edge case vectors + 3 sanity checks produce IDENTICAL results
+(same accept/reject decision AND same error code) between the reference
+(5x51-bit fiat-crypto) and AVX512 (6x43-bit r43x6) implementations.
+
+Key observations:
+- Both implementations correctly reject all small-order public keys
+- Both implementations correctly reject S >= L (scalar validation)
+- Both implementations correctly reject non-canonical R points
+- Sign-then-verify round-trip works identically on both paths
+- The fd_ed25519_verify shared code (fd_ed25519_user.c) provides a
+  single code path that calls backend-specific primitives:
+    - fd_ed25519_point_frombytes_2x (point decompression)
+    - fd_ed25519_affine_is_small_order
+    - fd_ed25519_double_scalar_mul_base
+    - fd_ed25519_point_eq_z1 (final R comparison)
+  The pre-checks (scalar validation, small-order rejection) are shared
+  code, reducing the divergence surface.
+
+===============================================================================
+5. CONCLUSION
+===============================================================================
+
+H6 hypothesis is NOT confirmed with these 20 test vectors.
+
+The shared verify logic in fd_ed25519_user.c performs scalar validation
+and small-order checks BEFORE reaching the backend-divergent code paths.
+This means many edge cases are caught by identical shared code regardless
+of the field arithmetic backend.
+
+The remaining attack surface for ref/avx512 divergence is narrow:
+- fd_ed25519_point_frombytes_2x (point decompression)
+- fd_ed25519_double_scalar_mul_base (the core scalar multiplication)
+- fd_ed25519_point_eq_z1 (final comparison)
+
+To more thoroughly test these, one would need:
+1. Valid signatures with crafted inputs that stress field boundary
+   conditions during scalar multiplication (requires knowing discrete
+   logs of specific points)
+2. Fuzzing fd_f25519 operations directly between ref and avx512
+   (Firedancer already has fuzz_ed25519_sigverify_diff.c for this)
+3. Testing the r43x6 representation transitions (unpacked->unsigned->
+   nearly_reduced->reduced) with values near carry boundaries
+
+No bounty-eligible bug found.
+
+===============================================================================
+6. FILES
+===============================================================================
+
+Test program:      F:\Claude\diff_test.c
+                   (also at /tmp/diff_test.c in WSL)
+Reference binary:  /tmp/test_ref
+AVX512 binary:     /tmp/test_avx512
+Intel SDE:         /tmp/sde-external-9.44.0-2024-08-22-lin/
+Firedancer repo:   /tmp/firedancer/
+AVX512 build cfg:  /tmp/firedancer/config/machine/linux_gcc_icelake_wsl.mk

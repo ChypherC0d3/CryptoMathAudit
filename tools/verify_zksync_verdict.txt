@@ -1,0 +1,167 @@
+VERDICT: DISPUTED (with nuance)
+
+Evidence:
+1. Code location: VERIFIED
+2. Behavior matches claim: YES (code exactly as described)
+3. Specification violated: YES (per EIP-7516 and EIP-4844)
+4. Documented as known: YES -- this is a documented, known limitation
+5. Real-world impact: LOW (documented limitation, no blob transactions on ZKsync L2 at this commit)
+6. Severity assessment: Informational (at best Low)
+
+========================================================================
+DETAILED ANALYSIS
+========================================================================
+
+## 1. Code Verification (CONFIRMED)
+
+At commit 4af87fdb6d30b8215d4affd81e6e5e9a8dbf8f52, in the file:
+  evm_interpreter/src/instructions/environment.rs
+
+BLOBHASH (0x49) at lines 94-99:
+- Ignores the index argument entirely (comment says "We ignore argument")
+- Always sets stack top to U256::ZERO
+- Does NOT call system.get_blob_hash()
+
+BLOBBASEFEE (0x4A) at lines 101-104:
+- Returns hardcoded U256::from(1)
+- Ignores _system parameter (prefixed with underscore)
+- Does NOT call system.metadata.blob_base_fee_per_gas()
+
+The code behavior matches the claim exactly.
+
+## 2. EIP Specification Check (CONFIRMED deviation)
+
+EIP-4844 specifies BLOBHASH (0x49) should:
+- Read an index from the stack
+- Return tx.blob_versioned_hashes[index] if index < len(hashes)
+- Return zeroed bytes32 only if index is out of bounds
+
+EIP-7516 specifies BLOBBASEFEE (0x4A) should:
+- Push the current block's blob base fee onto the stack
+- This is the result of get_blob_gasprice(header)
+
+The implementation deviates from both specifications.
+
+## 3. CRITICAL FINDING: This is a DOCUMENTED, KNOWN limitation
+
+Multiple official ZKsync documentation sources explicitly state:
+
+  "The same opcodes unsupported in EraVM remain unsupported:
+   CALLCODE, SELFDESTRUCT, BLOBHASH, BLOBBASEFEE."
+
+Sources:
+- https://docs.zksync.io/zksync-protocol/era-vm/evm-interpreter/evm-differences
+- ZKsync official blog post on EVM bytecode compatibility
+- Abstract chain docs (also ZKsync-based) confirm the same
+
+This is publicly documented as a known limitation of the EVM interpreter
+on ZKsync Era.
+
+## 4. Fix Commit Verification
+
+The claimed fix commits exist but are NOT on the main branch:
+
+- 7d4eb61b (2025-11-03): "fix blobbasefee opcode" -- changes blobbasefee
+  to use system.metadata.blob_base_fee_per_gas(). Only on ethproofs branches.
+
+- a92c2d0a (2025-11-14): "Fixed issue with blobbase fee" -- same fix for
+  blobbasefee, also on ethproofs branches only.
+
+- 6a3c2978 (2026-01-09): "feat!: EIP-4844 support (#381)" -- comprehensive
+  fix for BOTH blobhash and blobbasefee. On origin/dev but NOT origin/main.
+
+The dev branch (origin/dev) has proper implementations:
+- blobhash: reads index, calls system.get_blob_hash(index), returns hash or zero
+- blobbasefee: calls system.get_blob_base_fee_per_gas()
+
+However, origin/main STILL has the stub implementations as of the latest
+fetch. The EIP-4844 support PR explicitly notes: "EIP-4844 is disabled
+for production and is only used for eth-runner."
+
+## 5. Immunefi Scope Assessment
+
+The ZKsync OS bug bounty on Immunefi lists:
+- Repository: zksync-os at commit 4af87fdb (exact match)
+- Medium impact: "Undocumented deviation from EVM behavior" ($5,000)
+- The EVM interpreter is explicitly in scope
+
+HOWEVER, this is NOT an "undocumented" deviation. It is explicitly
+documented as unsupported. The Immunefi Medium category requires the
+deviation to be UNDOCUMENTED.
+
+## 6. Nuanced Assessment
+
+There IS a subtle argument to be made: the documentation says these
+opcodes are "unsupported," which typically implies they would revert or
+be rejected. Instead, the interpreter:
+- Accepts the opcodes without error
+- Returns plausible but incorrect values (0 and 1)
+- Does not revert or signal an error
+
+This "silent failure" behavior could be considered worse than truly
+unsupported (which would revert). A contract checking BLOBBASEFEE would
+get 1 instead of a revert, potentially making incorrect decisions.
+
+However, at this commit, ZKsync does not support blob transactions on L2
+at all, so there are no real blob hashes or blob base fees to return.
+The stub values are placeholders for a feature not yet enabled.
+
+## 7. Intentional Bug Consideration
+
+The Immunefi program page states: "As a promotional event to attract
+more security researchers, the ZKsync team has intentionally included a
+bug in their codebase that would lead to a Medium-level impact."
+
+This blob opcode behavior could potentially be that intentional bug,
+given it fits the "Undocumented deviation from EVM behavior" Medium
+category. However, the deviation IS documented, making it a poor fit.
+
+========================================================================
+RECOMMENDATION: DO NOT SUBMIT (as-is)
+========================================================================
+
+Reasons against submission:
+
+1. DOCUMENTED LIMITATION: BLOBHASH and BLOBBASEFEE are explicitly listed
+   as unsupported opcodes in official ZKsync documentation. The Immunefi
+   Medium category requires "undocumented" deviations.
+
+2. NO REAL-WORLD IMPACT: At this commit, blob transactions are not
+   supported on ZKsync L2. There are no real blob hashes or blob base
+   fees. The stubs exist as placeholders.
+
+3. ALREADY FIXED ON DEV: The development branch already contains
+   comprehensive EIP-4844 support (commit 6a3c2978), showing the team
+   is actively working on this. Reporting a known, in-progress feature
+   gap is unlikely to be rewarded.
+
+4. LIKELY DUPLICATE/KNOWN: Given the documentation explicitly lists
+   these as unsupported, any submission would likely be closed as a
+   known issue.
+
+If submitting anyway, the strongest angle would be:
+
+  "The opcodes are documented as 'unsupported' but the code does not
+   revert -- it silently returns incorrect values. True 'unsupported'
+   behavior should revert to prevent contracts from acting on false data.
+   This silent failure mode is itself an undocumented behavior."
+
+This angle is weak but defensible. Expected outcome: rejected or at
+best Informational with no payout.
+
+========================================================================
+FILES EXAMINED
+========================================================================
+
+Vulnerable code:
+  F:\Claude\BugBounty\tools\verify_zksync\evm_interpreter\src\instructions\environment.rs (lines 94-104)
+
+Opcode definitions:
+  F:\Claude\BugBounty\tools\verify_zksync\evm_interpreter\src\opcodes.rs (lines 157-158, 263-264)
+
+Interpreter dispatch:
+  F:\Claude\BugBounty\tools\verify_zksync\evm_interpreter\src\interpreter.rs (lines 296-297)
+
+System API (available but unused at this commit):
+  F:\Claude\BugBounty\tools\verify_zksync\zk_ee\src\system\metadata\system_metadata.rs (lines 61-63, 82-84)
+  F:\Claude\BugBounty\tools\verify_zksync\zk_ee\src\system\metadata\basic_metadata.rs (lines 47-52)

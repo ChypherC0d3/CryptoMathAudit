@@ -1,0 +1,245 @@
+Firedancer H6 AVX512 Differential Test -- Local Feasibility Report
+===================================================================
+Date: 2026-03-28
+Machine: Intel Core i7-7700K @ 4.20GHz, Windows 10 Home,
+         WSL2 Ubuntu 24.04 (Noble), GCC 13.3.0
+
+EXECUTIVE SUMMARY
+-----------------
+We CANNOT run the full AVX512 differential test natively on this machine
+because the i7-7700K (Kaby Lake) lacks AVX512 support. However, we CAN
+do significant testing locally for FREE using two approaches, and the
+full AVX512 test can be done for under $0.10 using Intel SDE locally
+or a cloud spot instance.
+
+=========================================================================
+1. SYSTEM CAPABILITIES
+=========================================================================
+
+CPU:     Intel Core i7-7700K (Kaby Lake, 2017)
+AVX:     Yes (AVX, AVX2)
+AVX512:  NO -- AVX512 was introduced in Skylake-X (server) / Ice Lake (client)
+WSL:     WSL2 with Ubuntu 24.04 (Noble Numbat)
+GCC:     13.3.0 (meets requirement of GCC 11+)
+Git:     2.43.0
+Make:    GNU Make (available)
+
+=========================================================================
+2. WHAT WORKS LOCALLY (FREE, RIGHT NOW)
+=========================================================================
+
+A) REFERENCE (non-AVX512) BUILD AND TEST -- WORKS
+
+   Firedancer cloned to:  /tmp/firedancer (inside WSL2)
+   Build command:
+     cd /tmp/firedancer
+     MACHINE=linux_gcc_minimal make -j4 test_ed25519
+
+   Run command:
+     ./build/linux/gcc/minimal/unit-test/test_ed25519
+
+   Status: PASSES ALL TESTS
+
+   NOTE: Must use MACHINE=linux_gcc_minimal (not linux_gcc_x86_64)
+   because the x86_64 config enables NUMA/shmem support which fails
+   in WSL2 due to missing /sys/devices/system/node sysfs entries.
+   The minimal config uses FD_ENV_STYLE=0 (POSIX) which avoids this.
+
+B) AVX512 BUILD (CROSS-COMPILATION) -- COMPILES, CANNOT RUN
+
+   Build command:
+     cd /tmp/firedancer
+     MACHINE=linux_gcc_icelake make -j4 test_ed25519
+
+   Status: COMPILES SUCCESSFULLY
+   The binary at build/linux/gcc/icelake/unit-test/test_ed25519
+   compiles fine with -march=icelake-server -DFD_HAS_AVX512=1
+   but triggers "Illegal instruction" when executed (expected).
+
+C) BOTH BUILDS COEXIST
+
+   The Firedancer build system supports multiple MACHINE targets
+   simultaneously. Reference output is in build/linux/gcc/minimal/
+   and AVX512 output is in build/linux/gcc/icelake/.
+
+=========================================================================
+3. OPTIONS FOR FULL AVX512 DIFFERENTIAL TEST
+=========================================================================
+
+OPTION 1: Intel SDE (FREE, LOCAL) -- RECOMMENDED
+-------------------------------------------------
+Cost: $0.00
+Time: ~30 minutes setup, ~10-60 min to run (SDE is slow, ~10-100x)
+
+Intel SDE v10.8.0 (2026-03-15) is free under Intel Simplified License.
+Download: https://www.intel.com/content/www/us/en/download/684897/intel-software-development-emulator.html
+File: sde-external-10.8.0-2026-03-15-lin.tar.xz (31.9 MB)
+
+Setup steps in WSL2:
+  1. Download and extract SDE:
+     cd /opt
+     wget https://downloadmirror.intel.com/843543/sde-external-10.8.0-2026-03-15-lin.tar.xz
+     tar xf sde-external-10.8.0-2026-03-15-lin.tar.xz
+     export PATH=/opt/sde-external-10.8.0-2026-03-15-lin:$PATH
+
+  2. Disable yama (required for SDE on Ubuntu):
+     echo 0 | sudo tee /proc/sys/kernel/yama/ptrace_scope
+
+  3. Run AVX512 binary under SDE:
+     sde64 -skl -- ./build/linux/gcc/icelake/unit-test/test_ed25519
+
+     Or with our custom test script:
+     cd /path/to/h6_test
+     ./test_h6_avx512.sh --sde
+
+Limitations:
+  - SDE is a FUNCTIONAL emulator (correctness only, not performance)
+  - Roughly 10-100x slower than native execution
+  - The fuzzer with 10M iterations may take hours under SDE
+  - Perfect for differential testing (comparing outputs, not speed)
+
+OPTION 2: AWS EC2 Spot Instance (~$0.02-0.05)
+----------------------------------------------
+Cost: ~$0.02-0.05 for a 15-30 minute session
+Time: ~5 min setup + ~10 min test
+
+Instance: c5.xlarge (Intel Xeon Platinum 8000, AVX512F support)
+  - On-demand: $0.17/hr
+  - Spot price: ~$0.03-0.05/hr (us-east-1, varies)
+  - Estimated total: $0.02-0.05 for a 30-minute session
+
+Steps:
+  1. Launch c5.xlarge spot instance with Ubuntu 22.04 AMI
+  2. SSH in, install build-essential git
+  3. Clone firedancer, build with MACHINE=linux_gcc_icelake
+  4. Run tests natively (fast, no emulation needed)
+  5. Terminate instance
+
+Alternative instances with AVX512:
+  - c5.large: cheaper but only 2 vCPUs ($0.01-0.03 spot)
+  - c5a.xlarge: AMD EPYC, NO AVX512 -- do NOT use
+  - c6i.xlarge: Intel Ice Lake, AVX512 ($0.03-0.05 spot)
+  - m5.xlarge: Intel Skylake/Cascade Lake, AVX512 ($0.03-0.06 spot)
+
+OPTION 3: GitHub Actions (FREE, but unreliable)
+------------------------------------------------
+Cost: $0.00
+Time: ~15 min to set up workflow
+
+GitHub Actions runners SOMETIMES have AVX512 (depends on which
+physical host your runner lands on). This is NOT reliable.
+See: https://github.com/actions/runner-images/discussions/3390
+
+If you get lucky, the test runs for free. If not, the job will
+crash with SIGILL. You could retry until you get an AVX512 host.
+
+NOT RECOMMENDED for deterministic testing.
+
+OPTION 4: Google Cloud / Azure / Hetzner
+-----------------------------------------
+Similar pricing to AWS spot. Hetzner dedicated servers can be
+significantly cheaper for longer runs.
+
+=========================================================================
+4. RECOMMENDED APPROACH (CHEAPEST PATH)
+=========================================================================
+
+Phase 1: Local reference testing (FREE, do this NOW)
+  - Already done. Reference build works in WSL2.
+  - Run our H6 test vectors against reference implementation.
+  - This catches bugs in the reference code path.
+
+Phase 2: Intel SDE for AVX512 (FREE, do this next)
+  - Download Intel SDE into WSL2 (32 MB download).
+  - Run the AVX512-compiled binary under SDE.
+  - Compare outputs between reference and AVX512 builds.
+  - This catches divergences between the two implementations.
+  - Use reduced fuzz iterations (e.g., 100K instead of 10M) to
+    compensate for SDE slowness.
+
+Phase 3: Native AVX512 validation (only if needed, ~$0.05)
+  - If SDE finds a divergence, confirm on real AVX512 hardware.
+  - Spin up a c5.xlarge spot instance for 15-30 minutes.
+  - Run full test suite natively at full speed.
+
+TOTAL COST: $0.00 for Phases 1-2, ~$0.05 max for Phase 3.
+
+=========================================================================
+5. QUICK-START COMMANDS
+=========================================================================
+
+# --- Phase 1: Reference test (already working) ---
+wsl -d Ubuntu -- bash -c "cd /tmp/firedancer && \
+  MACHINE=linux_gcc_minimal make -j4 test_ed25519 && \
+  ./build/linux/gcc/minimal/unit-test/test_ed25519"
+
+# --- Phase 2: Intel SDE setup ---
+wsl -d Ubuntu -- bash -c "
+  cd /tmp
+  wget -q https://downloadmirror.intel.com/843543/sde-external-10.8.0-2026-03-15-lin.tar.xz
+  tar xf sde-external-10.8.0-2026-03-15-lin.tar.xz
+  echo 0 | sudo tee /proc/sys/kernel/yama/ptrace_scope
+  export PATH=/tmp/sde-external-10.8.0-2026-03-15-lin:\$PATH
+  cd /tmp/firedancer
+  MACHINE=linux_gcc_icelake make -j4 test_ed25519
+  sde64 -icl -- ./build/linux/gcc/icelake/unit-test/test_ed25519
+"
+
+# --- Phase 2b: Run our custom H6 tests ---
+# First copy test files into firedancer source tree:
+wsl -d Ubuntu -- bash -c "
+  cp /mnt/f/Claude/BugBounty/targets/firedancer/h6_test/*.c \
+     /tmp/firedancer/src/ballet/ed25519/
+  cd /tmp/firedancer
+  # Build with our custom tests added to Local.mk
+  # (see test_h6_avx512.sh for automated setup)
+"
+
+# --- Phase 3: AWS spot (if needed) ---
+# aws ec2 run-instances \
+#   --image-id ami-0c7217cdde317cfec \
+#   --instance-type c5.xlarge \
+#   --instance-market-options '{"MarketType":"spot"}' \
+#   --key-name your-key \
+#   --security-group-ids sg-xxx
+
+=========================================================================
+6. EXISTING TEST FILES
+=========================================================================
+
+Location: F:\Claude\BugBounty\targets\firedancer\h6_test\
+
+  test_h6_vectors.c      - Static test vectors (RFC 8032 + edge cases)
+                           Compiled twice: once with FD_HAS_AVX512=0,
+                           once with FD_HAS_AVX512=1, outputs compared.
+
+  test_h6_inline_diff.c  - Inline differential test. Links BOTH
+                           implementations into a single binary (requires
+                           AVX512 hardware or SDE).
+
+  test_h6_fuzz.c         - Random fuzzer comparing reference vs AVX512
+                           outputs over millions of iterations.
+
+  test_h6_avx512.sh      - Automated build/run script with --sde and
+                           --ref-only flags.
+
+  README.md              - Detailed documentation.
+
+=========================================================================
+7. KEY FIREDANCER BUILD SYSTEM NOTES
+=========================================================================
+
+- GNUmakefile at repo root, not Makefile
+- MACHINE= selects target config from config/machine/*.mk
+- MACHINE=linux_gcc_minimal: no NUMA, no threads, POSIX-only (WSL-safe)
+- MACHINE=linux_gcc_x86_64: AVX2, has NUMA (fails in WSL2)
+- MACHINE=linux_gcc_icelake: AVX512, has NUMA (compiles but crashes
+  with SIGILL on non-AVX512 CPUs; use SDE to run)
+- Build outputs go to build/<machine>/unit-test/
+- Multiple MACHINE targets can coexist simultaneously
+- Firedancer source cloned to: /tmp/firedancer (WSL2)
+  (shallow clone, ~4081 files)
+
+=========================================================================
+END OF REPORT
+=========================================================================

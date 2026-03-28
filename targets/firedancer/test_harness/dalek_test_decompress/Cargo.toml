@@ -1,0 +1,8 @@
+[package]
+name = "dalek_test_decompress"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+curve25519-dalek = "3.2.1"
+hex = "0.4"

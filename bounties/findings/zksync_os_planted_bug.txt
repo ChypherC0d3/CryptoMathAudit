@@ -1,0 +1,167 @@
+================================================================================
+ZKsync OS Planted Bug Analysis
+================================================================================
+Date: 2026-03-28
+Bounty: ZKsync OS on Immunefi (up to $100K)
+Scope Commit: zksync-os @ 4af87fdb6d30b8215d4affd81e6e5e9a8dbf8f52
+Planted Bug Impact: Medium - "Undocumented deviation from EVM behavior (not related to gas)"
+================================================================================
+
+EXECUTIVE SUMMARY
+=================
+The planted bug is in the EVM interpreter's implementation of EIP-4844 blob
+opcodes, specifically BLOBBASEFEE (0x4A) and BLOBHASH (0x49). Both opcodes
+execute successfully but return hardcoded incorrect values instead of the actual
+blob-related data from the block header.
+
+While these opcodes are listed as "unsupported" in ZKsync documentation for the
+older EraVM system, the ZKsync OS EVM interpreter actually ACCEPTS and EXECUTES
+them (charging gas, manipulating the stack) but returns incorrect values. This
+creates a silent, exploitable EVM behavior deviation.
+
+================================================================================
+FINDING #1 (PRIMARY CANDIDATE): BLOBBASEFEE returns hardcoded 1
+================================================================================
+
+File: zksync-os/evm_interpreter/src/instructions/environment.rs
+Lines: 101-104 (in-scope commit 4af87fdb)
+
+    pub fn blobbasefee(&mut self, _system: &mut System<S>) -> InstructionResult {
+        self.gas.spend_gas_and_native(gas_constants::BASE, 40)?;
+        self.stack.push(&U256::from(1))           // <--- BUG: hardcoded 1
+    }
+
+EVM Specification (EIP-7516):
+  BLOBBASEFEE should return the blob base fee per gas for the current block,
+  as computed by get_blob_gasprice(header) from EIP-4844.
+
+Actual behavior:
+  Always returns 1, regardless of the actual blob base fee.
+
+Impact:
+  - Smart contracts using block.blobbasefee (Solidity 0.8.24+) will receive
+    incorrect pricing information
+  - Rollup contracts relying on BLOBBASEFEE for cost accounting will
+    miscalculate blob data costs
+  - Blob gas futures contracts would be exploitable
+  - Any L2/rollup protocol using this opcode for pricing decisions is affected
+
+Evidence this is the planted bug:
+  - The dev branch (origin/dev) contains a fix commit:
+    7d4eb61b "fix blobbasefee opcode" (2025-11-03)
+    a92c2d0a "Fixed issue with blobbase fee" (2025-11-14)
+  - The fix changes the return value from U256::from(1) to
+    system.metadata.blob_base_fee_per_gas()
+  - The fix was NOT merged to main before the bounty scope commit
+  - This is a clear "undocumented deviation from EVM behavior, not related to gas"
+
+================================================================================
+FINDING #2: BLOBHASH always returns zero
+================================================================================
+
+File: zksync-os/evm_interpreter/src/instructions/environment.rs
+Lines: 94-99 (in-scope commit 4af87fdb)
+
+    pub fn blobhash(&mut self, _system: &mut System<S>) -> InstructionResult {
+        self.gas.spend_gas_and_native(gas_constants::BLOBHASH, 40)?;
+        let stack_top = self.stack.top_mut()?; // We ignore argument  <--- comment acknowledges bug
+        *stack_top = U256::ZERO;               // <--- BUG: always returns 0
+        Ok(())
+    }
+
+EVM Specification (EIP-4844):
+  BLOBHASH pops an index from the stack and returns the versioned hash of
+  the blob at that index in the current transaction, or zero if the index
+  is out of bounds.
+
+Actual behavior:
+  Always returns 0 regardless of input, ignoring the actual blob hashes.
+  The comment "We ignore argument" explicitly acknowledges this deviation.
+
+Impact:
+  - Contracts verifying blob data commitments will fail silently
+  - EIP-4844 blob verification patterns are broken
+  - Any protocol relying on BLOBHASH for data availability proofs is affected
+
+Evidence:
+  - The dev branch contains a fix that implements actual blob hash lookup
+    via system.get_blob_hash(index)
+  - Same timeline as BLOBBASEFEE fix
+
+================================================================================
+ANALYSIS: WHY THESE ARE THE PLANTED BUGS
+================================================================================
+
+1. SEVERITY MATCH: The bounty specifies Medium severity = "Undocumented deviation
+   from EVM behavior (not related to gas)". Both findings are:
+   - Deviations from EVM behavior: YES (wrong return values)
+   - Not related to gas: YES (the gas charging is separate; the bug is in the
+     return values)
+   - Medium severity: YES (smart contracts get incorrect data, leading to
+     incorrect business logic)
+
+2. DOCUMENTATION STATUS: While ZKsync documentation for the OLD EraVM system
+   lists BLOBHASH and BLOBBASEFEE as "unsupported," this documentation refers
+   to the EraVM bytecode interpreter, not ZKsync OS. ZKsync OS claims to be
+   "fully EVM equivalent" targeting Cancun. The opcodes are implemented and
+   execute successfully (charge gas, don't revert) - they just return wrong
+   values. This makes the deviation UNDOCUMENTED for ZKsync OS.
+
+3. FIX EXISTS ON DEV: Both bugs have explicit fix commits on the dev branch
+   that were NOT merged to main before the bounty scope was set. This is
+   consistent with a deliberately planted bug.
+
+4. CODE COMMENT: The BLOBHASH implementation contains "// We ignore argument"
+   which is essentially a breadcrumb noting the intentional deviation.
+
+5. PATTERN: A planted bug at Medium severity would be something that:
+   - Is subtle enough to require code review (not just running tests)
+   - Has real impact on contract behavior
+   - Is clearly fixable
+   Both findings match this pattern perfectly.
+
+================================================================================
+ADDITIONAL FINDINGS (Not the planted bug, but notable)
+================================================================================
+
+A. Call-Stack Depth Check Ordering (Low - OZ audit L-3)
+   File: evm_interpreter/src/ee_trait_impl.rs, before_executing_frame()
+   Value transfer occurs before callstack depth check at line 351-358.
+   In standard EVM, depth check should precede value transfer.
+   Status: Known issue from OpenZeppelin audit.
+
+B. PUSH Native Gas Cost Non-Monotonicity (Low - OZ audit L-2)
+   PUSH15_NATIVE_COST (240) > PUSH16_NATIVE_COST (210)
+   This is a gas-related issue, so not the planted bug per bounty description.
+
+C. Return Data Not Cleared After Failed Deployment (Medium - OZ audit M-3)
+   When deployment fails due to EIP-158 or EIP-3541, return data should be
+   cleared but isn't in the current code.
+
+================================================================================
+RECOMMENDATION
+================================================================================
+
+Submit BLOBBASEFEE (Finding #1) as the primary report on Immunefi, with BLOBHASH
+(Finding #2) as a supporting/related finding. The BLOBBASEFEE bug is the
+stronger candidate because:
+  1. It returns a specific wrong value (1) rather than a generic zero
+  2. It has direct financial impact (incorrect blob pricing)
+  3. The fix commit is explicitly named "fix blobbasefee opcode"
+  4. EIP-7516 specifically motivated by enabling smart contracts to account
+     for blob fees - returning 1 defeats this purpose entirely
+
+Proof of Concept:
+  Deploy a contract calling BLOBBASEFEE opcode on ZKsync OS.
+  Compare result (always 1) with actual blob base fee from block header.
+  The values will differ whenever the real blob base fee != 1.
+
+================================================================================
+FILES REFERENCED
+================================================================================
+- F:\Claude\BugBounty\targets\zksync\zksync-os\evm_interpreter\src\instructions\environment.rs
+- F:\Claude\BugBounty\targets\zksync\zksync-os\evm_interpreter\src\interpreter.rs
+- F:\Claude\BugBounty\targets\zksync\zksync-os\evm_interpreter\src\opcodes.rs
+- F:\Claude\BugBounty\targets\zksync\zksync-os\evm_interpreter\src\gas_constants.rs
+- F:\Claude\BugBounty\targets\zksync\zksync-os\evm_interpreter\src\ee_trait_impl.rs
+================================================================================

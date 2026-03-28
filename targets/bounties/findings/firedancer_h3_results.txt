@@ -1,0 +1,393 @@
+================================================================================
+HYPOTHESIS H3: Small-Order Point Non-Canonical Encoding Analysis
+Date: 2026-03-28 08:42:14
+================================================================================
+
+================================================================================
+FIREDANCER SMALL-ORDER DETECTION ANALYSIS
+================================================================================
+
+Source: fd_curve25519.h, fd_ed25519_affine_is_small_order()
+
+The function checks if a decompressed (affine, Z==1) point has small order by:
+  1. X == 0  (catches identity and order-2 point)
+  2. Y == 0  (catches both order-4 points)
+  3. Y == order8_y0  (catches 2 order-8 points)
+  4. Y == order8_y1  (catches 2 order-8 points)
+
+The small-order y-coordinate table values:
+  order8_y0 = 0x05fc536d880238b13933c6d305acdfd5f098eff289f4c345b027b2c28f95e826
+  order8_y1 = 0x7a03ac9277fdc74ec6cc392cfa53202a0f67100d760b3cba4fd84d3d706a17c7
+
+CRITICAL FLOW in fd_ed25519_verify():
+  1. fd_ed25519_point_frombytes_2x(Aprime, pubkey, R, r)
+     -> calls fd_f25519_frombytes(y, buf) which REDUCES y mod p
+     -> then computes x from the REDUCED y
+     -> result: affine point with Z==1, canonical coordinates
+  2. fd_ed25519_affine_is_small_order(Aprime)
+     -> checks REDUCED X and Y values against table
+  3. Hash computation: SHA-512(R_bytes || A_bytes || msg)
+     -> uses ORIGINAL bytes (possibly non-canonical)
+
+CONSEQUENCE:
+  - Non-canonical encoding of small-order point y + p
+  - fd_f25519_frombytes reduces to canonical y
+  - Small-order check uses CANONICAL y -> CORRECTLY detects small order
+  - Firedancer REJECTS non-canonical small-order points (same as canonical)
+
+  BUT: If decompression succeeds and the point is NOT small-order,
+  the hash uses the ORIGINAL non-canonical bytes, producing a
+  DIFFERENT hash than the canonical encoding of the same point.
+  This is NOT a bug per se, as both Firedancer and Dalek accept
+  non-canonical encodings and hash the original bytes.
+
+================================================================================
+NON-CANONICAL ENCODING ANALYSIS FOR SMALL-ORDER Y-VALUES
+================================================================================
+
+  y=1 (identity):
+    y = 1
+    y + p = 57896044618658097711785492504343953926634992332820282019728792003956564819950
+    Fits in 255 bits: True
+    -> HAS non-canonical encoding
+    -> Reduced mod p: 1 (matches y: True)
+
+  y=p-1 (order 2):
+    y = 57896044618658097711785492504343953926634992332820282019728792003956564819948
+    y + p = 115792089237316195423570985008687907853269984665640564039457584007913129639897
+    Fits in 255 bits: False
+    -> NO non-canonical encoding
+
+  y=0 (order 4):
+    y = 0
+    y + p = 57896044618658097711785492504343953926634992332820282019728792003956564819949
+    Fits in 255 bits: True
+    -> HAS non-canonical encoding
+    -> Reduced mod p: 0 (matches y: True)
+
+  y=ORDER8_Y0:
+    y = 2707385501144840649318225287225658788936804267575313519463743609750303402022
+    y + p = 60603430119802938361103717791569612715571796600395595539192535613706868221971
+    Fits in 255 bits: False
+    -> NO non-canonical encoding
+
+  y=ORDER8_Y1:
+    y = 55188659117513257062467267217118295137698188065244968500265048394206261417927
+    y + p = 113084703736171354774252759721462249064333180398065250519993840398162826237876
+    Fits in 255 bits: False
+    -> NO non-canonical encoding
+
+================================================================================
+SMALL-ORDER POINT ENUMERATION AND ENCODING TEST
+================================================================================
+
+Found 8 small-order points:
+
+--- P0 (identity) (order 1) ---
+  x = 0x0000000000000000000000000000000000000000000000000000000000000000
+  y = 0x0000000000000000000000000000000000000000000000000000000000000001
+  x_sign = 0
+  Canonical encoding: 0100000000000000000000000000000000000000000000000000000000000000
+  Canonical decompression: OK (x_match=True, y_match=True)
+  Small-order check (canonical): True
+  Non-canonical encoding: eeffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f
+  Encodings differ: YES
+  Non-canonical decompression: OK
+    Reduced y matches canonical y: True
+    Reduced x matches canonical x: True
+  Small-order check (non-canonical): True
+  Same point after decompression: True
+
+--- P1 (order 2) (order 2) ---
+  x = 0x0000000000000000000000000000000000000000000000000000000000000000
+  y = 0x7fffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffec
+  x_sign = 0
+  Canonical encoding: ecffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f
+  Canonical decompression: OK (x_match=True, y_match=True)
+  Small-order check (canonical): True
+  Non-canonical encoding: NOT POSSIBLE (y >= 19)
+
+--- P2 (order 4) (order 4) ---
+  x = 0x2b8324804fc1df0b2b4d00993dfbd7a72f431806ad2fe478c4ee1b274a0ea0b0
+  y = 0x0000000000000000000000000000000000000000000000000000000000000000
+  x_sign = 0
+  Canonical encoding: 0000000000000000000000000000000000000000000000000000000000000000
+  Canonical decompression: OK (x_match=True, y_match=True)
+  Small-order check (canonical): True
+  Non-canonical encoding: edffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f
+  Encodings differ: YES
+  Non-canonical decompression: OK
+    Reduced y matches canonical y: True
+    Reduced x matches canonical x: True
+  Small-order check (non-canonical): True
+  Same point after decompression: True
+
+--- -P2 (order 4) (order 4) ---
+  x = 0x547cdb7fb03e20f4d4b2ff66c2042858d0bce7f952d01b873b11e4d8b5f15f3d
+  y = 0x0000000000000000000000000000000000000000000000000000000000000000
+  x_sign = 1
+  Canonical encoding: 0000000000000000000000000000000000000000000000000000000000000080
+  Canonical decompression: OK (x_match=True, y_match=True)
+  Small-order check (canonical): True
+  Non-canonical encoding: edffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff
+  Encodings differ: YES
+  Non-canonical decompression: OK
+    Reduced y matches canonical y: True
+    Reduced x matches canonical x: True
+  Small-order check (non-canonical): True
+  Same point after decompression: True
+
+--- P3 (order 8) (order 8) ---
+  x = 0x1fd5b9a006394a28e933993238de4abb5c193c7013e5e238dea14646c545d14a
+  y = 0x05fc536d880238b13933c6d305acdfd5f098eff289f4c345b027b2c28f95e826
+  x_sign = 0
+  Canonical encoding: 26e8958fc2b227b045c3f489f2ef98f0d5dfac05d3c63339b13802886d53fc05
+  Canonical decompression: OK (x_match=True, y_match=True)
+  Small-order check (canonical): True
+  Non-canonical encoding: NOT POSSIBLE (y >= 19)
+
+--- -P3 (order 8) (order 8) ---
+  x = 0x602a465ff9c6b5d716cc66cdc721b544a3e6c38fec1a1dc7215eb9b93aba2ea3
+  y = 0x05fc536d880238b13933c6d305acdfd5f098eff289f4c345b027b2c28f95e826
+  x_sign = 1
+  Canonical encoding: 26e8958fc2b227b045c3f489f2ef98f0d5dfac05d3c63339b13802886d53fc85
+  Canonical decompression: OK (x_match=True, y_match=True)
+  Small-order check (canonical): True
+  Non-canonical encoding: NOT POSSIBLE (y >= 19)
+
+--- P4 (order 8) (order 8) ---
+  x = 0x1fd5b9a006394a28e933993238de4abb5c193c7013e5e238dea14646c545d14a
+  y = 0x7a03ac9277fdc74ec6cc392cfa53202a0f67100d760b3cba4fd84d3d706a17c7
+  x_sign = 0
+  Canonical encoding: c7176a703d4dd84fba3c0b760d10670f2a2053fa2c39ccc64ec7fd7792ac037a
+  Canonical decompression: OK (x_match=True, y_match=True)
+  Small-order check (canonical): True
+  Non-canonical encoding: NOT POSSIBLE (y >= 19)
+
+--- -P4 (order 8) (order 8) ---
+  x = 0x602a465ff9c6b5d716cc66cdc721b544a3e6c38fec1a1dc7215eb9b93aba2ea3
+  y = 0x7a03ac9277fdc74ec6cc392cfa53202a0f67100d760b3cba4fd84d3d706a17c7
+  x_sign = 1
+  Canonical encoding: c7176a703d4dd84fba3c0b760d10670f2a2053fa2c39ccc64ec7fd7792ac03fa
+  Canonical decompression: OK (x_match=True, y_match=True)
+  Small-order check (canonical): True
+  Non-canonical encoding: NOT POSSIBLE (y >= 19)
+
+================================================================================
+VERIFICATION BEHAVIOR TESTS
+================================================================================
+
+--- P0 (identity) ---
+  As pubkey A (canonical):      REJECT   - ERR_PUBKEY: small order
+  As R       (canonical):       REJECT   - ERR_SIG: R small order
+  As pubkey A (non-canonical):  REJECT   - ERR_PUBKEY: small order
+  As R       (non-canonical):   REJECT   - ERR_SIG: R small order
+
+--- P1 (order 2) ---
+  As pubkey A (canonical):      REJECT   - ERR_PUBKEY: small order
+  As R       (canonical):       REJECT   - ERR_SIG: R small order
+  Non-canonical encoding: NOT POSSIBLE (y >= 19)
+
+--- P2 (order 4) ---
+  As pubkey A (canonical):      REJECT   - ERR_PUBKEY: small order
+  As R       (canonical):       REJECT   - ERR_SIG: R small order
+  As pubkey A (non-canonical):  REJECT   - ERR_PUBKEY: small order
+  As R       (non-canonical):   REJECT   - ERR_SIG: R small order
+
+--- -P2 (order 4) ---
+  As pubkey A (canonical):      REJECT   - ERR_PUBKEY: small order
+  As R       (canonical):       REJECT   - ERR_SIG: R small order
+  As pubkey A (non-canonical):  REJECT   - ERR_PUBKEY: small order
+  As R       (non-canonical):   REJECT   - ERR_SIG: R small order
+
+--- P3 (order 8) ---
+  As pubkey A (canonical):      REJECT   - ERR_PUBKEY: small order
+  As R       (canonical):       REJECT   - ERR_SIG: R small order
+  Non-canonical encoding: NOT POSSIBLE (y >= 19)
+
+--- -P3 (order 8) ---
+  As pubkey A (canonical):      REJECT   - ERR_PUBKEY: small order
+  As R       (canonical):       REJECT   - ERR_SIG: R small order
+  Non-canonical encoding: NOT POSSIBLE (y >= 19)
+
+--- P4 (order 8) ---
+  As pubkey A (canonical):      REJECT   - ERR_PUBKEY: small order
+  As R       (canonical):       REJECT   - ERR_SIG: R small order
+  Non-canonical encoding: NOT POSSIBLE (y >= 19)
+
+--- -P4 (order 8) ---
+  As pubkey A (canonical):      REJECT   - ERR_PUBKEY: small order
+  As R       (canonical):       REJECT   - ERR_SIG: R small order
+  Non-canonical encoding: NOT POSSIBLE (y >= 19)
+
+================================================================================
+FIREDANCER vs DALEK EXPECTED BEHAVIOR ANALYSIS
+================================================================================
+
+From Firedancer source comments (fd_ed25519_user.c:171-190):
+  - Neither Firedancer nor Dalek 2.x enforce canonicality checks
+  - Both accept non-canonical points (y >= p)
+  - Both reduce y mod p during decompression
+  - Both check small-order AFTER decompression
+
+For non-canonical small-order points:
+  Firedancer: decompress (reduces y) -> small-order check -> REJECT
+  Dalek 2.x:  decompress (reduces y) -> small-order check -> REJECT
+
+CONCLUSION: No behavioral difference expected for H3.
+  Both implementations reduce y mod p before small-order checking,
+  so non-canonical encodings of small-order points are correctly
+  detected and rejected by both.
+
+HOWEVER, there is a related edge case worth noting:
+  The point comparison in Firedancer uses projective equality
+  (line 226: fd_ed25519_point_eq_z1), while many implementations
+  compress R_computed and compare bytes. This could cause differences
+  for non-canonical NON-small-order points (tested separately).
+
+================================================================================
+EDGE CASE: NON-CANONICAL NON-SMALL-ORDER POINTS
+================================================================================
+
+  y=2: NOT on curve
+  y=3: valid point, small_order=False
+    -> Non-canonical, non-small-order point exists!
+    -> Canonical encoding: 0300000000000000000000000000000000000000000000000000000000000000
+    -> Non-canonical encoding: f0ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f
+    -> Same point after decompression: True
+  y=4: valid point, small_order=False
+    -> Non-canonical, non-small-order point exists!
+    -> Canonical encoding: 0400000000000000000000000000000000000000000000000000000000000080
+    -> Non-canonical encoding: f1ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff
+    -> Same point after decompression: True
+  y=5: valid point, small_order=False
+    -> Non-canonical, non-small-order point exists!
+    -> Canonical encoding: 0500000000000000000000000000000000000000000000000000000000000000
+    -> Non-canonical encoding: f2ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f
+    -> Same point after decompression: True
+  y=6: valid point, small_order=False
+    -> Non-canonical, non-small-order point exists!
+    -> Canonical encoding: 0600000000000000000000000000000000000000000000000000000000000000
+    -> Non-canonical encoding: f3ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f
+    -> Same point after decompression: True
+  y=7: NOT on curve
+  y=8: NOT on curve
+  y=9: valid point, small_order=False
+    -> Non-canonical, non-small-order point exists!
+    -> Canonical encoding: 0900000000000000000000000000000000000000000000000000000000000000
+    -> Non-canonical encoding: f6ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f
+    -> Same point after decompression: True
+  y=10: valid point, small_order=False
+    -> Non-canonical, non-small-order point exists!
+    -> Canonical encoding: 0a00000000000000000000000000000000000000000000000000000000000080
+    -> Non-canonical encoding: f7ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff
+    -> Same point after decompression: True
+  y=11: NOT on curve
+  y=12: NOT on curve
+  y=13: NOT on curve
+  y=14: valid point, small_order=False
+    -> Non-canonical, non-small-order point exists!
+    -> Canonical encoding: 0e00000000000000000000000000000000000000000000000000000000000080
+    -> Non-canonical encoding: fbffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff
+    -> Same point after decompression: True
+  y=15: valid point, small_order=False
+    -> Non-canonical, non-small-order point exists!
+    -> Canonical encoding: 0f00000000000000000000000000000000000000000000000000000000000000
+    -> Non-canonical encoding: fcffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f
+    -> Same point after decompression: True
+  y=16: valid point, small_order=False
+    -> Non-canonical, non-small-order point exists!
+    -> Canonical encoding: 1000000000000000000000000000000000000000000000000000000000000000
+    -> Non-canonical encoding: fdffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f
+    -> Same point after decompression: True
+  y=17: NOT on curve
+  y=18: valid point, small_order=False
+    -> Non-canonical, non-small-order point exists!
+    -> Canonical encoding: 1200000000000000000000000000000000000000000000000000000000000000
+    -> Non-canonical encoding: ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f
+    -> Same point after decompression: True
+
+================================================================================
+COMPREHENSIVE SIGNATURE TESTS
+================================================================================
+
+--- P0 (identity) ---
+  A=canonical, R=basepoint, S=0: REJECT (ERR_PUBKEY: small order)
+  A=non-canonical, R=basepoint, S=0: REJECT (ERR_PUBKEY: small order)
+  R=canonical, A=basepoint, S=0: REJECT (ERR_SIG: R small order)
+  R=non-canonical, A=basepoint, S=0: REJECT (ERR_SIG: R small order)
+  R=canonical, A=basepoint, S=1: REJECT (ERR_SIG: R small order)
+  R=non-canonical, A=basepoint, S=1: REJECT (ERR_SIG: R small order)
+
+--- P1 (order 2) ---
+  A=canonical, R=basepoint, S=0: REJECT (ERR_PUBKEY: small order)
+  R=canonical, A=basepoint, S=0: REJECT (ERR_SIG: R small order)
+  R=canonical, A=basepoint, S=1: REJECT (ERR_SIG: R small order)
+
+--- P2 (order 4) ---
+  A=canonical, R=basepoint, S=0: REJECT (ERR_PUBKEY: small order)
+  A=non-canonical, R=basepoint, S=0: REJECT (ERR_PUBKEY: small order)
+  R=canonical, A=basepoint, S=0: REJECT (ERR_SIG: R small order)
+  R=non-canonical, A=basepoint, S=0: REJECT (ERR_SIG: R small order)
+  R=canonical, A=basepoint, S=1: REJECT (ERR_SIG: R small order)
+  R=non-canonical, A=basepoint, S=1: REJECT (ERR_SIG: R small order)
+
+--- -P2 (order 4) ---
+  A=canonical, R=basepoint, S=0: REJECT (ERR_PUBKEY: small order)
+  A=non-canonical, R=basepoint, S=0: REJECT (ERR_PUBKEY: small order)
+  R=canonical, A=basepoint, S=0: REJECT (ERR_SIG: R small order)
+  R=non-canonical, A=basepoint, S=0: REJECT (ERR_SIG: R small order)
+  R=canonical, A=basepoint, S=1: REJECT (ERR_SIG: R small order)
+  R=non-canonical, A=basepoint, S=1: REJECT (ERR_SIG: R small order)
+
+--- P3 (order 8) ---
+  A=canonical, R=basepoint, S=0: REJECT (ERR_PUBKEY: small order)
+  R=canonical, A=basepoint, S=0: REJECT (ERR_SIG: R small order)
+  R=canonical, A=basepoint, S=1: REJECT (ERR_SIG: R small order)
+
+--- -P3 (order 8) ---
+  A=canonical, R=basepoint, S=0: REJECT (ERR_PUBKEY: small order)
+  R=canonical, A=basepoint, S=0: REJECT (ERR_SIG: R small order)
+  R=canonical, A=basepoint, S=1: REJECT (ERR_SIG: R small order)
+
+--- P4 (order 8) ---
+  A=canonical, R=basepoint, S=0: REJECT (ERR_PUBKEY: small order)
+  R=canonical, A=basepoint, S=0: REJECT (ERR_SIG: R small order)
+  R=canonical, A=basepoint, S=1: REJECT (ERR_SIG: R small order)
+
+--- -P4 (order 8) ---
+  A=canonical, R=basepoint, S=0: REJECT (ERR_PUBKEY: small order)
+  R=canonical, A=basepoint, S=0: REJECT (ERR_SIG: R small order)
+  R=canonical, A=basepoint, S=1: REJECT (ERR_SIG: R small order)
+
+================================================================================
+FINAL SUMMARY - HYPOTHESIS H3
+================================================================================
+
+NO BEHAVIORAL DISCREPANCIES FOUND between canonical and non-canonical
+encodings of small-order points in the Firedancer emulator.
+
+VERDICT: H3 NOT CONFIRMED
+
+Reason: Firedancer's verification flow is:
+  1. fd_f25519_frombytes() reduces y mod p FIRST
+  2. Decompression computes x from REDUCED y
+  3. Small-order check operates on REDUCED (canonical) coordinates
+  4. Both canonical and non-canonical encodings reduce to the same point
+  5. Small-order detection works correctly for both
+
+The small-order table contains CANONICAL y-values,
+and since decompression reduces y mod p before the check,
+non-canonical encodings do NOT bypass the small-order filter.
+
+Key y-values with non-canonical representations:
+  y=0 (order 4): canonical 0x00, non-canonical 0x00 + p
+  y=1 (identity): canonical 0x01, non-canonical 0x01 + p
+  Both correctly detected as small-order after reduction.
+
+NOTE: This analysis is based on the Python Firedancer emulator.
+The actual C implementation should be tested with the Rust harness
+for definitive confirmation.
+
+Elapsed time: 0.02 seconds
+================================================================================

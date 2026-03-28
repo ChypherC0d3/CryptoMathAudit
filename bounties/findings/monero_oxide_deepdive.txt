@@ -1,0 +1,482 @@
+================================================================================
+MONERO-OXIDE DEEP DIVE AUDIT REPORT
+Target: https://github.com/monero-oxide/monero-oxide (main branch)
+Immunefi Program: https://immunefi.com/bug-bounty/monero-oxide/
+Date: 2026-03-28
+================================================================================
+
+SCOPE VERIFICATION
+==================
+In-scope asset: https://github.com/monero-oxide/monero-oxide/tree/main
+Reward tiers:
+  - Critical: $100,000 (private spend key recovery, forged proofs, fake funds)
+  - High: $10,000 (signing unintended messages, protocol incompatibilities)
+  - Medium: $5,000
+  - Low: $1,000
+
+Qualifying impacts include:
+  - Unintended, undocumented recovery of private spend keys
+  - Signing of unintended messages
+  - Reportedly received funds which were not actually received
+  - Ability to forge proofs present with only the default features
+  - Cryptographic formula errors affecting verifiers or provers
+  - Monero protocol incompatibilities requiring substantial reimplementation
+
+Author: Luke Parker (kayabaNerve)
+Audited by: Cypher Stack (May 2025, PDF published August 2025)
+
+================================================================================
+CODEBASE ARCHITECTURE
+================================================================================
+
+Workspace crates (in dependency order):
+  monero-io             - Serialization primitives (VarInt, read/write helpers)
+  monero-ed25519        - Ed25519 points, scalars, commitments, hash-to-point
+  monero-primitives     - Keccak256, bounds types
+  monero-mlsag          - MLSAG linkable ring signatures (legacy)
+  monero-clsag          - CLSAG linkable ring signatures (modern)
+  monero-borromean      - Borromean range proofs (legacy)
+  monero-bulletproofs   - Bulletproofs and Bulletproofs+ range proofs
+  monero-oxide          - Transaction types, RingCT, block structures
+  monero-wallet         - Scanning, sending, key derivation, addresses
+
+================================================================================
+CRYPTOGRAPHIC PRIMITIVE ANALYSIS
+================================================================================
+
+1. ED25519 POINT VALIDATION
+----------------------------
+File: monero-oxide/ed25519/src/compressed_point.rs
+
+CompressedPoint::decompress() checks:
+  - Decompresses via curve25519_dalek
+  - Re-compresses and checks round-trip: point.compress().to_bytes() == self.0
+  - This catches unreduced field elements AND negative-zero (-0) encoding
+
+ASSESSMENT: CORRECT. The re-compression check enforces canonical encoding. Points
+with unreduced y-coordinates or -0 are rejected. This matches Monero C++ behavior.
+
+Note: decompress() does NOT check for subgroup membership. This is intentional
+and documented: torsioned points are valid Ed25519 points. Subgroup checks are
+done where needed (key images, ViewPair spend keys).
+
+
+2. SCALAR VALIDATION
+---------------------
+File: monero-oxide/ed25519/src/scalar.rs
+
+Scalar::read() uses curve25519_dalek::Scalar::from_canonical_bytes() which
+rejects scalars >= L (the curve order). This is correct.
+
+Scalar::hash() uses from_bytes_mod_order() (narrow 32-byte reduction) which
+matches Monero's Hs() function. It asserts the result is non-zero (panics on
+zero), matching Monero's behavior.
+
+ASSESSMENT: CORRECT. Scalar validation follows reference implementation.
+
+POTENTIAL CONCERN: Scalar::hash() panics on zero result instead of returning
+an error. While the probability is negligible (~2^-252), a panic in a verifier
+path could be a DoS vector if an attacker could craft a transaction whose
+verification triggers this. However, this would require finding a Keccak-256
+preimage for a multiple of L, which is computationally infeasible.
+
+
+3. UNREDUCED SCALAR HANDLING (BORROMEAN LEGACY)
+-------------------------------------------------
+File: monero-oxide/ed25519/src/unreduced_scalar.rs
+
+The ref10_slide_scalar_vartime() function handles the known Monero issue #8438
+where legacy Borromean range proofs used unreduced scalars that were incorrectly
+interpreted by ref10's slide() function. This implementation recovers the
+scalar that Monero's slide() would have computed.
+
+ASSESSMENT: CORRECT. The implementation properly handles this known edge case.
+The optimization at line 140 (checking if bit 255 is unset, bypassing the NAF
+recovery) is correct because the NAF with width 5 adds at most 1 bit.
+
+
+4. COFACTOR HANDLING
+---------------------
+Ed25519 cofactor is 8. Key areas checked:
+
+a) Key Images (point.rs line 173-179):
+   Point::key_image() rejects identity AND non-torsion-free points. This
+   prevents the 2017 CryptoNote key image double-spend vulnerability.
+   ASSESSMENT: CORRECT.
+
+b) CLSAG D component (clsag/src/lib.rs line 459-462):
+   D is decompressed, then mul_by_cofactor() is applied. Identity after
+   cofactor clearing is rejected.
+   ASSESSMENT: CORRECT.
+
+c) Bulletproofs verification points are multiplied by cofactor after
+   decompression (A, S, T1, T2, L, R all use mul_by_cofactor()).
+   ASSESSMENT: CORRECT.
+
+d) biased_hash (hash-to-point) applies mul_by_cofactor() at line 145.
+   ASSESSMENT: CORRECT. Output is in the prime-order subgroup.
+
+e) SharedKeyDerivations uses mul_by_cofactor() on ECDH result (8Ra).
+   ASSESSMENT: CORRECT. Matches Monero protocol.
+
+f) ViewPair rejects torsioned spend keys.
+   ASSESSMENT: CORRECT.
+
+
+5. CLSAG RING SIGNATURES
+--------------------------
+File: monero-oxide/ringct/clsag/src/lib.rs
+
+Verification flow:
+  - Ring must be non-empty, s.len() must match ring.len()
+  - Key image I: decompressed, canonical check, torsion-free check, non-identity
+  - pseudo_out: decompressed
+  - D: decompressed, cofactor-cleared, non-identity after clearing
+  - Ring members: all decompressed (canonical check implicit)
+  - Core loop computes challenges in constant-time for signing path
+  - Final c1 comparison
+
+ASSESSMENT: CORRECT. The verification follows the Monero CLSAG specification.
+
+INVESTIGATED POTENTIAL ISSUES:
+
+a) Ring member points are decompressed but NOT checked for torsion.
+   This is intentional and matches Monero C++. The CLSAG protocol handles
+   torsion through the cofactor clearing of D and the key image check.
+
+b) The constant-time signing loop (lines 213-253) uses conditional_select
+   and conditional_assign to avoid leaking the signer index. This appears
+   correct.
+
+c) Decoys validation (decoys.rs): The ring size is bounded by MAX_RING_SIZE=255.
+   The signer_index is validated to be within bounds in constant time.
+   Offsets are checked to form valid monotonically increasing positions.
+   ASSESSMENT: CORRECT.
+
+
+6. MLSAG RING SIGNATURES
+--------------------------
+File: monero-oxide/ringct/mlsag/src/lib.rs
+
+Verification:
+  - Ring matrix must have >= 2 members
+  - Key images checked via key_image() (torsion-free, non-identity)
+  - Standard Schnorr-like verification loop
+
+ASSESSMENT: CORRECT for verification-only purposes. MLSAG signing is not
+implemented (only CLSAG signing is supported for modern transactions).
+
+
+7. BULLETPROOFS (ORIGINAL)
+---------------------------
+Files: monero-oxide/ringct/bulletproofs/src/original/mod.rs
+       monero-oxide/ringct/bulletproofs/src/original/inner_product.rs
+
+Prove/Verify:
+  - Statement creation validates commitment count (1..=16)
+  - Transcript follows Monero's hash chain: V -> A,S -> T1,T2 -> tau_x,mu,t_hat
+  - INV_EIGHT preprocessing + cofactor clearing on verification
+  - Inner product proof uses batched verification accumulator
+  - L/R length validated against expected log2(generators)
+
+INVESTIGATED AREA - transcript_T12 (line 96-103):
+  The transcript includes `transcript.to_bytes()` TWICE:
+    buf.extend(transcript.to_bytes());
+    buf.extend(transcript.to_bytes());
+  This appears intentional - it matches Monero C++ which also hashes z twice.
+  This is NOT a bug, it is the Monero protocol.
+
+ASSESSMENT: CORRECT. Bulletproofs verification matches reference implementation.
+
+
+8. BULLETPROOFS+
+------------------
+Files: monero-oxide/ringct/bulletproofs/src/plus/aggregate_range_proof.rs
+       monero-oxide/ringct/bulletproofs/src/plus/weighted_inner_product.rs
+
+Key observations:
+  - Generator roles are SWAPPED: g=H (value), h=G (mask) per Monero convention
+  - This is handled in BulletproofsPlusBatchVerifier::verify() which passes
+    (MONERO_H, ED25519_BASEPOINT_POINT) instead of the usual order
+  - Transcript uses biased_hash of a constant as initial value (matching Monero)
+  - INV_EIGHT preprocessing + cofactor clearing
+  - WIP proof verification accumulates into batch verifier
+
+ASSESSMENT: CORRECT. The generator swap is the most error-prone aspect and it
+is handled consistently.
+
+
+9. BORROMEAN RANGE PROOFS
+--------------------------
+File: monero-oxide/ringct/borromean/src/lib.rs
+
+  - Uses UnreducedScalar with ref10_slide_scalar_vartime() for s0/s1
+  - Verifies bit commitments sum to total commitment
+  - Subtraction of H*2^i for the second ring
+
+ASSESSMENT: CORRECT for verification. Properly handles legacy unreduced scalars.
+
+
+10. PEDERSEN COMMITMENTS
+-------------------------
+File: monero-oxide/ed25519/src/commitment.rs
+
+  commit() = mask * G + amount * H
+  Uses multiscalar_mul for efficiency.
+  H is hardcoded as a known nothing-up-my-sleeve point.
+
+ASSESSMENT: CORRECT. Standard Pedersen commitment.
+
+
+11. KEY DERIVATION / STEALTH ADDRESSES
+----------------------------------------
+File: monero-oxide/wallet/src/lib.rs, wallet/src/send/tx_keys.rs
+
+ECDH: v * R (view key * transaction pubkey)
+Shared secret: 8 * v * R (cofactor clearing)
+Output key: Hs(8vR || o) * G + B (where B is spend pubkey)
+
+The "guaranteed" (burning bug immune) variant binds to input key images via
+uniqueness = keccak256("uniqueness" || key_images).
+
+Subaddress handling: When sending to subaddresses, per-output additional keys
+are generated with distinct randomness. The optimization for 2-output
+transactions (where the change output uses the view key directly) matches
+Monero wallet2 behavior.
+
+ASSESSMENT: CORRECT.
+
+INVESTIGATED AREA - Payment ID XOR:
+  payment_id_xor uses keccak256(8Ra || 0x8d) which matches Monero.
+  Dummy payment IDs for 2-output transactions without payment IDs are
+  included (matching wallet2 behavior).
+
+
+12. TRANSACTION SERIALIZATION
+------------------------------
+File: monero-oxide/src/transaction.rs
+
+  - Version 1/2 support
+  - Proper prefix hashing for v2 (3-hash structure: prefix, base, prunable)
+  - Signature hash excludes ring signatures (for v1) / CLSAGs (for v2)
+  - Weight calculation includes Bulletproof clawback
+
+ASSESSMENT: CORRECT.
+
+
+13. BATCH VERIFICATION
+-----------------------
+File: monero-oxide/ringct/bulletproofs/src/batch_verifier.rs
+
+The batch verifier accumulates weighted terms and performs a single MSM.
+Individual proof weights are random scalars from the RNG passed to verify().
+
+ASSESSMENT: CORRECT. Random weights prevent cross-proof cancellation.
+
+================================================================================
+POTENTIAL FINDINGS (ORDERED BY SEVERITY)
+================================================================================
+
+FINDING 1: PANIC IN VERIFICATION PATH VIA Scalar::hash() ZERO CHECK
+Severity: LOW (borderline informational)
+Impact: Denial of Service (panic/crash)
+File: monero-oxide/ed25519/src/scalar.rs, lines 130-134
+
+Scalar::hash() contains an assert!() that panics if the keccak256 hash output
+reduces to zero modulo L. This function is called in verification paths:
+  - CLSAG core loop (line 250 of clsag/src/lib.rs): Scalar::hash(&to_hash)
+  - MLSAG verification (line 188 of mlsag/src/lib.rs): Scalar::hash(&buf)
+  - Borromean verification (line 82,89): Scalar::hash(...)
+  - Bulletproofs transcript functions
+
+If an attacker could craft a transaction where any of these hash invocations
+yields a scalar congruent to 0 mod L, the verifier would panic instead of
+returning an error. While finding such a preimage is computationally infeasible
+(~2^-252 probability per hash), a panic in a node's verification code is
+worse than returning an error.
+
+The comment in the code acknowledges this: "we don't propagate the error, and
+simply panic here." Monero C++ returns an error instead.
+
+Exploitability: Practically zero due to hash preimage difficulty.
+Recommendation: Return Err/None instead of panicking.
+
+
+FINDING 2: POTENTIAL RING MEMBER POINT VALIDITY GAP IN CLSAG
+Severity: INFORMATIONAL (not exploitable due to canonical check)
+File: monero-oxide/ringct/clsag/src/lib.rs, lines 464-468
+
+Ring members are decompressed via CompressedPoint::decompress() which checks
+canonical encoding. However, ring member points are NOT checked for:
+  - Being the identity point
+  - Being torsion-free
+
+This matches the Monero C++ implementation which also does not check ring
+members for these properties. The CLSAG protocol's security does not require
+ring members to be in the prime-order subgroup (the key image and D checks
+handle the cryptographic security).
+
+Exploitability: None. This is protocol-correct behavior.
+
+
+FINDING 3: EXTRA FIELD PARSING STOPS ON UNKNOWN TAG
+Severity: INFORMATIONAL
+File: monero-oxide/wallet/src/extra.rs, line 429
+
+Extra::read() stops parsing on an unknown tag (via the `break` on ExtraField::read
+error). This matches Monero wallet2 behavior where an unparseable extra tag
+causes the rest of the extra to be ignored. However, this means that data AFTER
+an unknown tag is invisible to the scanner.
+
+Exploitability: None for the bug bounty scope. A malicious sender could
+potentially hide payment data after an unknown tag, but this would only affect
+their own transaction.
+
+
+FINDING 4: MISSING RING SIZE MINIMUM CHECK IN CLSAG VERIFY
+Severity: INFORMATIONAL
+File: monero-oxide/ringct/clsag/src/lib.rs, lines 443-448
+
+The CLSAG verification checks ring.is_empty() but does not enforce a minimum
+ring size (Monero consensus requires ring size == 16 for current hard fork).
+However, this is documented as intentional: monero-oxide does not attempt to
+implement all consensus rules, deferring that to works like Cuprate.
+
+Exploitability: None within monero-oxide's scope. Consensus rules are expected
+to be enforced by the calling node implementation.
+
+
+FINDING 5: COMMITMENT SUM OVERFLOW IN AMOUNT CALCULATIONS
+Severity: INFORMATIONAL
+File: monero-oxide/wallet/src/send/tx_keys.rs, lines 286-297
+
+The change amount calculation:
+  inputs - (payments + necessary_fee)
+
+uses u64 arithmetic. The validate() function checks for overflow at the u128
+level (lines 388-413 of send/mod.rs), so this subtraction should be safe.
+However, the intermediate .sum::<u64>() on line 286 and 293 could theoretically
+overflow for pathological inputs (though validate() should prevent this).
+
+Exploitability: None. The validate() pre-check prevents overflow.
+
+================================================================================
+COMPARISON WITH REFERENCE MONERO C++ IMPLEMENTATION
+================================================================================
+
+Known Historical Bugs Checked:
+
+1. CryptoNote Key Image Bug (2017) - COFACTOR ATTACK
+   Status: MITIGATED. Point::key_image() checks is_torsion_free().
+   File: monero-oxide/ed25519/src/point.rs, line 175
+
+2. Burning Bug (2018) - DUPLICATE STEALTH ADDRESS
+   Status: DOCUMENTED. Scanner documentation explicitly warns about this.
+   GuaranteedScanner provides burning-bug-immune scanning via uniqueness binding.
+   File: monero-oxide/wallet/src/scan.rs, lines 334-343
+
+3. Multiple Counting Bug (2018) - DUPLICATE TX PUBKEY
+   Status: MITIGATED. Extra::keys() returns all PublicKey entries but only the
+   first PublicKeys entry. The scanner iterates through all keys but breaks
+   after the first match per output (line 261 of scan.rs).
+
+4. 10 Block Decoy Bug (2023)
+   Status: NOT APPLICABLE. This was a wallet-level decoy selection issue.
+   monero-oxide does not implement decoy selection policy (that's left to the
+   caller).
+
+5. Unreduced Scalar in Borromean (Issue #8438)
+   Status: MITIGATED. UnreducedScalar with ref10_slide_scalar_vartime() properly
+   handles this legacy issue.
+
+================================================================================
+CYPHER STACK AUDIT (MAY 2025)
+================================================================================
+
+The audit PDF is present at:
+  audits/Cypher Stack May 2025/Audit.pdf
+
+The README states this was an audit of Serai's /networks/monero which became
+the monero-oxide folder. The audit was funded via Monero CCS for 1,050 XMR.
+Provenance: https://github.com/cypherstack/monero_wallet_audit/releases/tag/1.1
+
+Unable to extract detailed findings from the PDF (no PDF renderer available).
+The audit scope covered monero-serai and monero-wallet libraries, including
+CLSAG multisig formalization and security proofs derived from FROST.
+
+================================================================================
+AREAS NOT FULLY EXPLOITABLE BUT WORTH DEEPER INVESTIGATION
+================================================================================
+
+1. DETERMINISTIC RNG FOR TRANSACTION CONSTRUCTION
+   File: monero-oxide/wallet/src/send/tx_keys.rs
+
+   The seeded_rng function derives a ChaCha20Rng from:
+     keccak256(DST_len || DST || outgoing_view_key || sorted_input_keys_and_commitments)
+
+   If an attacker knows the outgoing_view_key AND the inputs, they can predict
+   all randomness used in the transaction (nonces, key selections, etc.). This
+   is by design (for reproducibility/eventuality matching) but means the
+   outgoing_view_key MUST be kept secret.
+
+   The shuffle of payments uses this same seeded RNG, meaning the payment order
+   is deterministic given the same inputs and outgoing_view_key.
+
+2. BULLETPROOFS+ z_pow COMPUTATION
+   File: monero-oxide/ringct/bulletproofs/src/plus/aggregate_range_proof.rs
+
+   Lines 104-114: z_pow computes z^{2j} for j=1..m but uses z_pow[0] = z^2 and
+   then multiplies each subsequent entry by z_pow[0] (which is z^2). This
+   produces: z^2, z^4, z^6, z^8... This is correct for the protocol but worth
+   noting that z_pow has length V.len()+1 (due to the push on line 110), while
+   d iterates j from 1 to V.len() and indexes z_pow[j-1]. This indexing is
+   correct.
+
+3. WEIGHTED INNER PRODUCT PROOF - inv_y COMPUTATION
+   File: monero-oxide/ringct/bulletproofs/src/plus/weighted_inner_product.rs
+
+   Lines 320-330: The verifier computes inv_y incrementally as:
+     inv_y[0] = y[0].invert()
+     inv_y[i] = inv_y * inv_y[i-1]
+
+   Wait - line 326 uses `inv_y * res.last()` where inv_y is y[0].invert().
+   This produces: y^{-1}, y^{-2}, y^{-3}...
+   This is correct for computing inverse y powers.
+
+================================================================================
+CONCLUSION
+================================================================================
+
+After thorough review of all cryptographic primitives in monero-oxide:
+
+- Point validation is properly implemented with canonical encoding checks
+- Scalar validation enforces reduction modulo L
+- Cofactor handling is correct across all primitives (key images, ECDH, D, etc.)
+- The 2017 key image double-spend bug is properly mitigated
+- The 2018 burning bug is documented and mitigatable via GuaranteedScanner
+- CLSAG signing and verification appear correct
+- Bulletproofs and Bulletproofs+ verification match reference implementation
+- Borromean legacy proof verification handles unreduced scalars correctly
+- Transaction serialization and hashing follow Monero protocol
+
+NO CRITICAL OR HIGH SEVERITY EXPLOITABLE BUGS WERE FOUND.
+
+The codebase demonstrates strong cryptographic engineering with:
+  - Consistent use of constant-time operations for secret data
+  - Proper zeroization of sensitive material
+  - Thorough canonical encoding enforcement
+  - Correct cofactor handling throughout
+  - Good documentation of known issues and intentional divergences
+
+The most actionable finding is Finding 1 (Scalar::hash panic in verification),
+which is Low severity at best given the computational infeasibility of triggering
+it. It would be a cleaner implementation to return an error, but it does not
+represent an exploitable vulnerability.
+
+The code has been audited by Cypher Stack (May 2025) and includes a verify-chain
+test that deserializes and verifies the entire Monero blockchain, providing
+strong confidence in protocol compatibility.
+
+================================================================================
+END OF REPORT
+================================================================================

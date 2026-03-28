@@ -23,3 +23,6 @@ __pycache__/
 *.csv
 *.tsv
 *.gz
+targets/monero-oxide/
+targets/wormhole/
+tools/verify_zksync/
